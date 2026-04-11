@@ -3,8 +3,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Dict
 
 import numpy as np
@@ -31,9 +33,15 @@ class EmbeddingStore:
         self.embeddings_dir = self.root / "embeddings"
         self.metadata_dir = self.root / "metadata"
         self.stats_path = self.metadata_dir / "stats.json"
+        self._lock = Lock()
+        self._centroids: Dict[str, np.ndarray] = {}
+        self._identity_sample_counts: Dict[str, int] = {}
+        self._identity_count = 0
+        self._embedding_count = 0
         self.faces_dir.mkdir(parents=True, exist_ok=True)
         self.embeddings_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
+        self.refresh_cache()
 
     def _identity_dir(self, name: str) -> Path:
         return self.faces_dir / name
@@ -54,49 +62,109 @@ class EmbeddingStore:
         embedding = embedding.astype(np.float32)
         if embedding_path.exists():
             existing = np.load(embedding_path)
+            if existing.ndim == 1:
+                existing = existing[None, :]
             merged = np.concatenate([existing, embedding[None, :]], axis=0)
         else:
             merged = embedding[None, :]
         np.save(embedding_path, merged)
+        self.refresh_cache()
         self.write_stats()
         return int(merged.shape[0])
 
-    def load_all_centroids(self) -> Dict[str, np.ndarray]:
+    def _centroid_for_embeddings(self, embeddings: np.ndarray) -> np.ndarray | None:
+        if embeddings.size == 0:
+            return None
+        if embeddings.ndim == 1:
+            embeddings = embeddings[None, :]
+        centroid = embeddings.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid = centroid / norm
+        return centroid.astype(np.float32)
+
+    def refresh_cache(self) -> None:
         centroids: Dict[str, np.ndarray] = {}
+        identity_sample_counts: Dict[str, int] = {}
+        identity_count = 0
+        embedding_count = 0
+
         for embedding_path in sorted(self.embeddings_dir.glob("*.npy")):
             try:
                 embeddings = np.load(embedding_path)
             except OSError:
                 continue
-            if embeddings.size == 0:
+
+            centroid = self._centroid_for_embeddings(embeddings)
+            if centroid is None:
                 continue
-            centroid = embeddings.mean(axis=0)
-            norm = np.linalg.norm(centroid)
-            if norm > 0:
-                centroid = centroid / norm
-            centroids[embedding_path.stem] = centroid.astype(np.float32)
-        return centroids
+
+            if embeddings.ndim == 1:
+                sample_count = 1
+            elif embeddings.ndim == 2:
+                sample_count = int(embeddings.shape[0])
+            else:
+                continue
+
+            centroids[embedding_path.stem] = centroid
+            identity_sample_counts[embedding_path.stem] = sample_count
+            identity_count += 1
+            embedding_count += sample_count
+
+        with self._lock:
+            self._centroids = centroids
+            self._identity_sample_counts = identity_sample_counts
+            self._identity_count = identity_count
+            self._embedding_count = embedding_count
+
+    def load_all_centroids(self) -> Dict[str, np.ndarray]:
+        with self._lock:
+            return {
+                name: centroid.copy() for name, centroid in self._centroids.items()
+            }
 
     def identity_count(self) -> int:
-        return len(list(self.embeddings_dir.glob("*.npy")))
+        with self._lock:
+            return self._identity_count
 
     def embedding_count(self) -> int:
-        total = 0
-        for embedding_path in self.embeddings_dir.glob("*.npy"):
-            try:
-                embeddings = np.load(embedding_path)
-            except OSError:
-                continue
-            if embeddings.ndim == 2:
-                total += int(embeddings.shape[0])
-        return total
+        with self._lock:
+            return self._embedding_count
+
+    def list_identities(self) -> list[dict]:
+        with self._lock:
+            return [
+                {
+                    "name": name,
+                    "sample_count": self._identity_sample_counts.get(name, 0),
+                }
+                for name in sorted(self._centroids)
+            ]
+
+    def delete_identity(self, name: str) -> bool:
+        removed = False
+        identity_dir = self._identity_dir(name)
+        embedding_path = self._embedding_path(name)
+
+        if identity_dir.exists():
+            shutil.rmtree(identity_dir, ignore_errors=True)
+            removed = True
+        if embedding_path.exists():
+            embedding_path.unlink(missing_ok=True)
+            removed = True
+
+        if removed:
+            self.refresh_cache()
+            self.write_stats()
+        return removed
 
     def write_stats(self) -> None:
-        payload = {
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "identity_count": self.identity_count(),
-            "embedding_count": self.embedding_count(),
-        }
+        with self._lock:
+            payload = {
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "identity_count": self._identity_count,
+                "embedding_count": self._embedding_count,
+            }
         self.stats_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -156,6 +224,27 @@ class FaceEmbeddingService:
             "status": "ok",
         }
 
+    def list_identities(self) -> dict:
+        identities = self.store.list_identities()
+        return {
+            "identities": identities,
+            "identity_count": self.store.identity_count(),
+            "embedding_count": self.store.embedding_count(),
+        }
+
+    def delete_identity(self, name: str) -> dict:
+        clean_name = name.strip()
+        if not clean_name:
+            raise HTTPException(status_code=400, detail="name is empty")
+        removed = self.store.delete_identity(clean_name)
+        return {
+            "name": clean_name,
+            "removed": removed,
+            "identity_count": self.store.identity_count(),
+            "embedding_count": self.store.embedding_count(),
+            "status": "ok",
+        }
+
     def recognize(self, image_bytes: bytes) -> dict:
         query = self.embed_bytes(image_bytes)
         centroids = self.store.load_all_centroids()
@@ -207,12 +296,22 @@ def health() -> dict:
     }
 
 
+@app.get("/identities")
+def identities() -> dict:
+    return service.list_identities()
+
+
 @app.post("/register")
 async def register(name: str = Form(...), photo: UploadFile = File(...)) -> dict:
     image_bytes = await photo.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="empty photo")
     return service.register(name=name, image_bytes=image_bytes)
+
+
+@app.post("/delete_identity")
+async def delete_identity(name: str = Form(...)) -> dict:
+    return service.delete_identity(name=name)
 
 
 @app.post("/recognize")

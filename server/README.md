@@ -1,188 +1,84 @@
-# Embedding Service
+# 远端识别服务模块
 
-这个目录提供一个可独立部署的人脸 embedding 后端，直接兼容当前桌面程序已有的接口形态：
+`server/` 目录用于承载可独立部署的远端识别服务。它的职责不是替代桌面端，而是把推理与身份库维护能力从 GUI 程序中拆出来，便于后续单独部署、调试和扩展。
+
+## 模块定位
+
+桌面端主要负责：
+
+- 摄像头采集
+- 本地样本管理
+- 界面展示
+- 本地训练与识别流程调度
+
+`server/` 主要负责：
+
+- 接收上传的人脸图片
+- 执行远端识别推理
+- 维护远端身份样本与统计信息
+- 返回识别结果给桌面端
+
+## 接口结构
+
+当前服务提供以下接口：
 
 - `POST /register`
+  用于注册单张人脸样本。
 - `POST /recognize`
+  用于提交单张人脸图并返回识别结果。
 - `GET /health`
+  用于查看服务存活状态和运行信息。
+- `GET /identities`
+  用于查询当前身份库概况。
+- `POST /delete_identity`
+  用于删除指定身份。
 
-## 设计目标
+## 目录职责
 
-当前桌面程序已经会在本地完成人脸裁剪，因此这个后端默认假设上传过来的图片已经是单张人脸图。
+```text
+server/
+├── embedding_service.py
+├── README.md
+└── runtime/
+    └── .gitkeep
+```
 
-服务端职责只保留三件事：
+运行过程中，服务会把运行时数据写入 `server/runtime/`，例如：
 
-- 提取 embedding
-- 维护本地 embedding 库
-- 完成人脸比对并返回姓名或“未知”
+- 样本图片
+- 识别用数据文件
+- 统计信息
 
-## 运行环境
+这些运行期数据不应提交到仓库。
 
-推荐部署到 `Linux x86_64`。
+## 与桌面端关系
 
-默认实现使用：
+桌面端通过 `service/vision.py` 中的识别与注册线程调用远端服务接口。也就是说：
+
+1. 桌面端完成人脸裁剪。
+2. 裁剪结果通过 HTTP 提交给远端服务。
+3. 远端服务完成识别或注册处理。
+4. 结果返回给桌面端界面。
+
+这种设计可以把 GUI、摄像头处理和远端推理解耦，便于后续替换服务实现。
+
+## 运行依赖
+
+当前服务侧实现基于：
 
 - `FastAPI`
+- `uvicorn`
 - `PyTorch`
 - `facenet-pytorch`
 
-之所以先不用 `MindSpore` 作为在线服务底座，是因为在线部署优先级是“先稳定跑通”，而不是把服务端环境锁死在更挑系统版本的依赖上。
+这里保留的是服务模块本身，不绑定特定机器、特定端口或特定部署环境。实际部署时，请根据自己的服务器环境单独配置。
 
-## 目录结构
+## 建议阅读顺序
 
-运行后会在 `server/runtime/` 下生成数据：
+如果你要继续修改远端服务，建议按下面顺序阅读：
 
-```text
-server/runtime/
-├── faces/
-│   └── 张三/
-├── embeddings/
-│   └── 张三.npy
-└── metadata/
-    └── stats.json
-```
+1. `server/embedding_service.py`
+2. `service/vision.py`
+3. `service/remote_sync.py`
 
-## 接口说明
-
-### `GET /health`
-
-返回服务状态、设备信息和当前 embedding 库规模。
-
-### `POST /register`
-
-表单参数：
-
-- `name`
-- `photo`
-
-行为：
-
-- 保存上传图片
-- 提取 embedding
-- 追加到对应身份的人脸库
-
-### `POST /recognize`
-
-表单参数：
-
-- `photo`
-
-返回示例：
-
-```json
-{
-  "name": "张三",
-  "matched": true,
-  "score": 0.8421,
-  "threshold": 0.72,
-  "identity_count": 5,
-  "embedding_count": 18
-}
-```
-
-未命中时：
-
-```json
-{
-  "name": "未知",
-  "matched": false,
-  "score": 0.5512,
-  "threshold": 0.72,
-  "identity_count": 5,
-  "embedding_count": 18
-}
-```
-
-## 启动方式
-
-### 1. 用 `uv` 创建环境
-
-```bash
-uv venv .service-venv
-```
-
-### 2. 安装依赖
-
-如果直接用 `server/requirements.txt` 能成功解析，最简单：
-
-```bash
-uv pip install --python .service-venv/bin/python -r server/requirements.txt
-```
-
-如果目标机需要先固定 CPU 版 `PyTorch`，可以用下面这组已经验证过的命令：
-
-```bash
-uv pip install --python .service-venv/bin/python \
-  --index-url https://download.pytorch.org/whl/cpu \
-  torch==2.2.2 torchvision==0.17.2
-
-uv pip install --python .service-venv/bin/python \
-  fastapi "uvicorn[standard]" python-multipart facenet-pytorch==2.6.0
-```
-
-### 3. 启动服务
-
-前台启动：
-
-```bash
-./.service-venv/bin/python -m uvicorn server.embedding_service:app --host 0.0.0.0 --port 8000
-```
-
-后台启动：
-
-```bash
-mkdir -p logs
-nohup ./.service-venv/bin/python -m uvicorn server.embedding_service:app \
-  --host 0.0.0.0 \
-  --port 8000 > logs/embedding_service.log 2>&1 &
-```
-
-## 可选环境变量
-
-- `FACE_SERVICE_DATA_DIR`
-  默认 `server/runtime`
-- `FACE_SERVICE_MODEL`
-  默认 `vggface2`
-- `FACE_SERVICE_THRESHOLD`
-  默认 `0.72`
-- `FACE_SERVICE_DEVICE`
-  默认自动选择 `cuda` 或 `cpu`
-
-## 与当前桌面程序对接
-
-桌面端现在支持通过环境变量指定服务地址：
-
-```bash
-FACE_SERVICE_BASE_URL=http://<server-host>:8000 uv run python main.py
-```
-
-如果服务端 `8000` 没有直接对外暴露，推荐在桌面端机器上先建立 SSH 隧道：
-
-```bash
-ssh -o StrictHostKeyChecking=no -L 18000:127.0.0.1:8000 <user>@<server-host> -p <ssh-port> -N
-```
-
-然后直接启动桌面程序即可。当前桌面端默认会优先请求：
-
-```bash
-http://127.0.0.1:18000
-```
-
-## 健康检查
-
-```bash
-curl http://127.0.0.1:8000/health
-```
-
-如果返回类似下面的数据，说明服务已经跑起来：
-
-```json
-{
-  "status": "ok",
-  "device": "cpu",
-  "model": "vggface2",
-  "threshold": 0.72,
-  "identity_count": 0,
-  "embedding_count": 0
-}
-```
+这样可以先看远端服务本身，再看桌面端如何发请求和做本地远端同步。

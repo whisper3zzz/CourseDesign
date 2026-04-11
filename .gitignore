@@ -35,3 +35,6 @@ __pycache__/*
 /data/celeba/subsets/*
 /server/runtime/*
 !/server/runtime/.gitkeep
+/docs/智能系统课程设计实验报告.md
+/docs/assets/report_ui_*.png
+/scripts/start_with_ssh_tunnel.local.sh

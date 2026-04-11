@@ -3,6 +3,7 @@ import json
 import os.path
 import sys
 import threading
+from datetime import datetime
 from queue import Empty, Full, Queue
 
 import PIL
@@ -16,7 +17,6 @@ from utils.vision import VisionTools, draw_rectangle, draw_text
 from utils.mediapipe.mp import MediaPipe as MP
 import multiprocessing
 import requests
-from requests_toolbelt import MultipartEncoder
 from time import sleep
 
 FACE_SERVICE_BASE_URL = os.getenv('FACE_SERVICE_BASE_URL', 'http://127.0.0.1:18000').rstrip('/')
@@ -119,6 +119,15 @@ class VisionService(QThread):
 def classicFaceRecognize(faces, classicPredictor):
     res = classicPredictor.predict(faces)
     return res[1], res[2]
+
+
+def encode_face_image(image):
+    if image is None or image.size == 0:
+        raise ValueError('empty face image')
+    success, encoded = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    if not success:
+        raise ValueError('failed to encode face image')
+    return encoded.tobytes()
 
 
 class ReadCameraThread(threading.Thread):
@@ -437,6 +446,11 @@ class ReadCameraThread(threading.Thread):
         return None
 
     def register_face_inner(self, name):
+        clean_name = name.strip()
+        if not clean_name:
+            self.registerResultSignal.emit('注册失败：姓名不能为空')
+            return
+
         if self.current_frame is None:
             self.registerResultSignal.emit('注册失败：当前没有可用画面')
             return
@@ -452,7 +466,7 @@ class ReadCameraThread(threading.Thread):
             return
 
         self.current_face = target_face
-        self.registerQueue.put((face_image, name))
+        self.registerQueue.put((face_image, clean_name))
 
     def mindfaceInit(self):
         if not MINDSPORE_AVAILABLE:
@@ -864,42 +878,41 @@ class RecogThread(QThread):
         self.config = ConfigStore()
         self.faces = []
         self.labels = []
+        self.http = requests.Session()
 
     def run(self):
-        # keep only one element in the queue
         while True:
-            if not self.recogQueue.empty():
-                faces = self.recogQueue.get()
-                try:
-                    if self.config.get_config('recog_method') == self.config.recog_methods_mapper['classic']:
-                        if not self.classicFaceRecognizer.trained:
-                            continue
-                        label, possibility = classicFaceRecognize(faces, self.classicFaceRecognizer)
-                        print(f"possibility: {possibility} name: {label}")
-                        if label:
-                            self.resultSignal.emit(str(label))
-                    if self.config.get_config('recog_method') == self.config.recog_methods_mapper['mindspore']:
-                        # 发请求到远端 embedding 服务
-                        os.makedirs('temp', exist_ok=True)
-                        cv2.imwrite('temp/recog.jpg', faces)
-                        url = f"{FACE_SERVICE_BASE_URL}/recognize"
-                        m = MultipartEncoder(
-                            fields={'photo': ('recog.jpg', open('temp/recog.jpg', 'rb'), 'image/jpeg')}
-                        )
-                        headers = {
-                            'Content-Type': m.content_type,
-                        }
-                        response = requests.request("POST", headers=headers, url=url, data=m, timeout=8)
-                        print(response)
-                        if response.status_code == 200:
-                            payload = response.json()
-                            self.resultSignal.emit(payload.get('name', '未知'))
-                except (RuntimeError, cv2.error, requests.RequestException) as exc:
-                    print(f"recognition error: {exc}")
-                    continue
-                except Exception as exc:
-                    print(f"unexpected recognition error: {exc}")
-                    continue
+            try:
+                faces = self.recogQueue.get(timeout=0.2)
+            except Empty:
+                continue
+
+            try:
+                if self.config.get_config('recog_method') == self.config.recog_methods_mapper['classic']:
+                    if not self.classicFaceRecognizer.trained:
+                        continue
+                    label, possibility = classicFaceRecognize(faces, self.classicFaceRecognizer)
+                    print(f"possibility: {possibility} name: {label}")
+                    if label:
+                        self.resultSignal.emit(str(label))
+                if self.config.get_config('recog_method') == self.config.recog_methods_mapper['mindspore']:
+                    photo_bytes = encode_face_image(faces)
+                    url = f"{FACE_SERVICE_BASE_URL}/recognize"
+                    response = self.http.post(
+                        url,
+                        files={'photo': ('recog.jpg', photo_bytes, 'image/jpeg')},
+                        timeout=8,
+                    )
+                    print(response)
+                    if response.status_code == 200:
+                        payload = response.json()
+                        self.resultSignal.emit(payload.get('name', '未知'))
+            except (RuntimeError, ValueError, cv2.error, requests.RequestException) as exc:
+                print(f"recognition error: {exc}")
+                continue
+            except Exception as exc:
+                print(f"unexpected recognition error: {exc}")
+                continue
 
 class RegisterThread(QThread):
     def __init__(self, registerResultSignal):
@@ -907,57 +920,47 @@ class RegisterThread(QThread):
         self.config = ConfigStore()
         self.registerQueue = self.config.registerQueue
         self.registerResultSignal = registerResultSignal
+        self.http = requests.Session()
 
     def run(self):
         while True:
-            if not self.registerQueue.empty():
-                faces, name = self.registerQueue.get()
-                temp_dir = 'temp'
-                temp_path = os.path.join(temp_dir, 'register.jpg')
-                local_dir = os.path.join('dataset', 'full', name)
-                local_path = os.path.join(local_dir, f'{name}.jpg')
+            try:
+                faces, name = self.registerQueue.get(timeout=0.2)
+            except Empty:
+                continue
 
-                try:
-                    os.makedirs(temp_dir, exist_ok=True)
-                    os.makedirs(local_dir, exist_ok=True)
+            clean_name = name.strip()
+            if not clean_name:
+                self.registerResultSignal.emit("注册失败：姓名不能为空")
+                continue
 
-                    if not cv2.imwrite(local_path, faces):
-                        self.registerResultSignal.emit("注册失败：无法写入本地样本")
-                        continue
+            local_dir = os.path.join('dataset', 'full', clean_name)
 
-                    if not cv2.imwrite(temp_path, faces):
-                        self.registerResultSignal.emit("注册失败：无法写入临时文件")
-                        continue
+            try:
+                photo_bytes = encode_face_image(faces)
+                os.makedirs(local_dir, exist_ok=True)
 
-                    url = f"{FACE_SERVICE_BASE_URL}/register"
-                    with open(temp_path, 'rb') as photo_file:
-                        m = MultipartEncoder(
-                            fields={
-                                'name': name,
-                                'photo': ('register.jpg', photo_file, 'image/jpeg'),
-                            }
-                        )
-                        headers = {
-                            'Content-Type': m.content_type,
-                        }
-                        response = requests.request(
-                            "POST",
-                            headers=headers,
-                            url=url,
-                            data=m,
-                            timeout=8,
-                        )
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                local_path = os.path.join(local_dir, f'{timestamp}.jpg')
+                with open(local_path, 'wb') as sample_file:
+                    sample_file.write(photo_bytes)
 
-                    print(response)
-                    if response.status_code == 200:
-                        self.registerResultSignal.emit("注册成功：已保存本地样本并同步到服务")
-                    else:
-                        self.registerResultSignal.emit(
-                            f"本地采集成功：远端服务返回 {response.status_code}"
-                        )
-                except requests.RequestException:
-                    self.registerResultSignal.emit("本地采集成功：远端注册服务不可用")
-                except OSError:
-                    self.registerResultSignal.emit("注册失败：读写注册文件时出错")
-                finally:
-                    os.path.exists(temp_path) and os.remove(temp_path)
+                url = f"{FACE_SERVICE_BASE_URL}/register"
+                response = self.http.post(
+                    url,
+                    data={'name': clean_name},
+                    files={'photo': ('register.jpg', photo_bytes, 'image/jpeg')},
+                    timeout=8,
+                )
+
+                print(response)
+                if response.status_code == 200:
+                    self.registerResultSignal.emit("注册成功：已保存本地样本并同步到服务")
+                else:
+                    self.registerResultSignal.emit(
+                        f"本地采集成功：远端服务返回 {response.status_code}"
+                    )
+            except requests.RequestException:
+                self.registerResultSignal.emit("本地采集成功：远端注册服务不可用")
+            except (OSError, ValueError):
+                self.registerResultSignal.emit("注册失败：读写注册文件时出错")

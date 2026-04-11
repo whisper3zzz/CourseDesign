@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
 )
 
+from service.remote_sync import reconcile_remote_samples
 from store.config import ConfigStore
 from view.mainDisplay import Ui_System
 
@@ -39,6 +40,8 @@ class MainPage(QMainWindow, Ui_System):
         self.sample_root = os.path.join("dataset", "full")
         self.sample_identity_count = 0
         self.sample_file_count = 0
+        self.startup_remote_sync_thread = None
+        self.startup_remote_sync_running = False
 
         self.setup_chrome()
 
@@ -80,6 +83,7 @@ class MainPage(QMainWindow, Ui_System):
         self.refresh_sample_overview()
         self.update_status_labels()
         self.animate_intro()
+        QTimer.singleShot(0, self.start_startup_remote_sync)
 
         if self.classicPredictor.trained:
             self.putLog(
@@ -87,74 +91,94 @@ class MainPage(QMainWindow, Ui_System):
             )
 
     def setup_chrome(self):
-        self.setWindowTitle("神经扫描终端")
+        self.setWindowTitle("人脸识别调度台")
         self.setMaximumSize(16777215, 16777215)
-        self.setMinimumSize(1024, 640)
-        self.resize(1280, 760)
+        self.setMinimumSize(1120, 700)
+        self.resize(1360, 820)
 
         self.leftCard = QFrame(self)
         self.leftCard.setObjectName("leftCard")
-        self.leftCard.setGeometry(12, 12, 210, 486)
+        self.leftCard.setGeometry(16, 16, 280, 640)
 
         self.previewCard = QFrame(self)
         self.previewCard.setObjectName("previewCard")
-        self.previewCard.setGeometry(230, 12, 680, 486)
+        self.previewCard.setGeometry(312, 16, 706, 640)
 
         self.rightCard = QFrame(self)
         self.rightCard.setObjectName("rightCard")
-        self.rightCard.setGeometry(926, 12, 242, 486)
+        self.rightCard.setGeometry(1034, 16, 310, 640)
+
+        self.samplePanel = QFrame(self)
+        self.samplePanel.setObjectName("samplePanel")
+
+        self.actionPanel = QFrame(self)
+        self.actionPanel.setObjectName("actionPanel")
+
+        self.logPanel = QFrame(self)
+        self.logPanel.setObjectName("logPanel")
+
+        self.controlPanel = QFrame(self)
+        self.controlPanel.setObjectName("controlPanel")
+
+        self.resultPanel = QFrame(self)
+        self.resultPanel.setObjectName("resultPanel")
+
+        self.previewFooterPanel = QFrame(self)
+        self.previewFooterPanel.setObjectName("previewFooterPanel")
 
         self.accentOrbOne = QFrame(self)
         self.accentOrbOne.setObjectName("accentOrbOne")
-        self.accentOrbOne.setGeometry(780, 12, 120, 120)
+        self.accentOrbOne.setGeometry(866, 14, 132, 132)
 
         self.accentOrbTwo = QFrame(self)
         self.accentOrbTwo.setObjectName("accentOrbTwo")
-        self.accentOrbTwo.setGeometry(1048, 392, 96, 96)
+        self.accentOrbTwo.setGeometry(1206, 500, 112, 112)
 
         self.subtitleLabel = QLabel(self)
         self.subtitleLabel.setObjectName("subtitleLabel")
-        self.subtitleLabel.setGeometry(28, 60, 170, 20)
-        self.subtitleLabel.setText("实时生物识别终端")
+        self.subtitleLabel.setGeometry(40, 68, 190, 20)
+        self.subtitleLabel.setText("采集 / 训练 / 同步")
 
         self.logSectionLabel = QLabel(self)
         self.logSectionLabel.setObjectName("logSectionLabel")
-        self.logSectionLabel.setGeometry(28, 92, 170, 18)
-        self.logSectionLabel.setText("系统事件")
+        self.logSectionLabel.setGeometry(40, 400, 170, 18)
+        self.logSectionLabel.setText("事件流")
 
         self.previewTitleLabel = QLabel(self)
         self.previewTitleLabel.setObjectName("previewTitleLabel")
-        self.previewTitleLabel.setGeometry(256, 34, 240, 28)
-        self.previewTitleLabel.setText("神经视觉画面")
+        self.previewTitleLabel.setGeometry(344, 40, 260, 30)
+        self.previewTitleLabel.setText("实时侦测画面")
 
         self.previewSubtitleLabel = QLabel(self)
         self.previewSubtitleLabel.setObjectName("previewSubtitleLabel")
-        self.previewSubtitleLabel.setGeometry(256, 64, 420, 18)
-        self.previewSubtitleLabel.setText("连接摄像头后，可直接开始识别")
+        self.previewSubtitleLabel.setGeometry(344, 612, 520, 18)
+        self.previewSubtitleLabel.setText("等待视频流、远端检查与识别状态更新")
 
         self.cameraBadge = QLabel(self)
         self.cameraBadge.setObjectName("cameraBadge")
-        self.cameraBadge.setGeometry(736, 32, 152, 30)
+        self.cameraBadge.setGeometry(822, 38, 164, 30)
         self.cameraBadge.setAlignment(Qt.AlignCenter)
 
         self.controlSubtitleLabel = QLabel(self)
         self.controlSubtitleLabel.setObjectName("controlSubtitleLabel")
-        self.controlSubtitleLabel.setGeometry(950, 62, 180, 18)
-        self.controlSubtitleLabel.setText("开始识别后会自动锁定人脸")
+        self.controlSubtitleLabel.setGeometry(1062, 66, 232, 36)
+        self.controlSubtitleLabel.setText("锁脸方式、识别方式和远端状态都在这里统一调度")
+        self.controlSubtitleLabel.setWordWrap(True)
 
         self.resultHintLabel = QLabel(self)
         self.resultHintLabel.setObjectName("resultHintLabel")
-        self.resultHintLabel.setGeometry(950, 324, 180, 18)
-        self.resultHintLabel.setText("连接摄像头后，可直接开始识别")
+        self.resultHintLabel.setGeometry(1062, 418, 232, 34)
+        self.resultHintLabel.setText("识别命中后，这里显示最近样本")
+        self.resultHintLabel.setWordWrap(True)
 
         self.leftNodeLabel = QLabel(self)
         self.leftNodeLabel.setObjectName("leftNodeLabel")
-        self.leftNodeLabel.setGeometry(28, 290, 176, 16)
-        self.leftNodeLabel.setText("步骤 1 / 连接摄像头")
+        self.leftNodeLabel.setGeometry(40, 118, 220, 58)
+        self.leftNodeLabel.setText("启动检查\n连接摄像头后进入采集或识别流程")
 
         self.sampleStatsLabel = QLabel(self)
         self.sampleStatsLabel.setObjectName("sampleStatsLabel")
-        self.sampleStatsLabel.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.sampleStatsLabel.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.sampleStatsLabel.setWordWrap(True)
 
         self.deleteSampleButton = QPushButton(self)
@@ -167,59 +191,61 @@ class MainPage(QMainWindow, Ui_System):
 
         self.previewMetaLabel = QLabel(self)
         self.previewMetaLabel.setObjectName("previewMetaLabel")
-        self.previewMetaLabel.setGeometry(256, 34, 632, 28)
+        self.previewMetaLabel.setGeometry(586, 40, 400, 28)
         self.previewMetaLabel.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.previewMetaLabel.setText("画面 640x480  /  实时视频流")
+        self.previewMetaLabel.setText("画面 640x480  /  主视频流")
 
         self.previewBeamTop = QFrame(self)
         self.previewBeamTop.setObjectName("previewBeamTop")
-        self.previewBeamTop.setGeometry(274, 88, 596, 2)
+        self.previewBeamTop.setGeometry(338, 98, 628, 2)
 
         self.previewBeamBottom = QFrame(self)
         self.previewBeamBottom.setObjectName("previewBeamBottom")
-        self.previewBeamBottom.setGeometry(274, 480, 596, 2)
+        self.previewBeamBottom.setGeometry(338, 574, 628, 2)
 
-        self.label.setGeometry(28, 28, 170, 30)
-        self.logText.setGeometry(28, 114, 176, 176)
-        self.nameInput.setGeometry(28, 312, 176, 40)
-        self.sampleStatsLabel.setGeometry(28, 358, 176, 34)
-        self.imgRegister.setGeometry(28, 362, 176, 36)
-        self.startTrainButton.setGeometry(28, 406, 176, 36)
-        self.deleteSampleButton.setGeometry(28, 450, 84, 36)
-        self.clearSamplesButton.setGeometry(120, 450, 84, 36)
-        self.switchButton.setGeometry(28, 494, 176, 36)
+        self.label.setGeometry(40, 34, 200, 32)
+        self.logText.setGeometry(40, 424, 220, 208)
+        self.nameInput.setGeometry(40, 242, 220, 44)
+        self.sampleStatsLabel.setGeometry(40, 186, 220, 44)
+        self.imgRegister.setGeometry(40, 316, 220, 40)
+        self.startTrainButton.setGeometry(40, 366, 220, 40)
+        self.deleteSampleButton.setGeometry(40, 416, 106, 40)
+        self.clearSamplesButton.setGeometry(154, 416, 106, 40)
+        self.switchButton.setGeometry(40, 466, 220, 40)
 
-        self.displayField.setGeometry(252, 104, 636, 366)
-        self.label_2.setGeometry(950, 36, 120, 24)
-        self.openDetection.setGeometry(950, 94, 160, 22)
-        self.detectMethod.setGeometry(950, 122, 194, 38)
-        self.openRecognition.setGeometry(950, 176, 160, 22)
-        self.recogMethod.setGeometry(950, 204, 194, 38)
-        self.loadMindSporeFace.setGeometry(950, 256, 194, 38)
-        self.label_3.setGeometry(950, 296, 120, 24)
-        self.resultFace.setGeometry(986, 354, 122, 96)
-        self.resultLabel.setGeometry(968, 458, 160, 26)
+        self.displayField.setGeometry(344, 118, 642, 438)
+        self.label_2.setGeometry(1062, 40, 150, 26)
+        self.openDetection.setGeometry(1062, 126, 210, 24)
+        self.detectMethod.setGeometry(1062, 156, 232, 40)
+        self.openRecognition.setGeometry(1062, 214, 210, 24)
+        self.recogMethod.setGeometry(1062, 244, 232, 40)
+        self.loadMindSporeFace.setGeometry(1062, 308, 232, 40)
+        self.label_3.setGeometry(1062, 390, 150, 24)
+        self.resultFace.setGeometry(1114, 468, 128, 128)
+        self.resultLabel.setGeometry(1062, 614, 232, 30)
 
-        self.label.setText("扫描核心")
-        self.label_2.setText("识别控制")
-        self.label_3.setText("识别目标")
+        self.label.setText("样本中枢")
+        self.label_2.setText("识别调度")
+        self.label_3.setText("目标画像")
         self.switchButton.setText("连接摄像头")
         self.startTrainButton.setText("用本地样本训练")
         self.imgRegister.setText("采集当前人脸")
-        self.loadMindSporeFace.setText("查看深度服务状态")
-        self.nameInput.setPlaceholderText("输入姓名后采集当前人脸")
+        self.loadMindSporeFace.setText("检查远端深度服务")
+        self.nameInput.setPlaceholderText("输入姓名，准备采集或管理样本")
         self.displayField.setText("实时扫描画面将在这里启动")
         self.displayField.setAlignment(Qt.AlignCenter)
         self.displayField.setWordWrap(True)
-        self.resultFace.setText("等待识别")
+        self.resultFace.setText("待命中")
         self.resultFace.setAlignment(Qt.AlignCenter)
         self.resultFace.setWordWrap(True)
         self.resultLabel.setText("等待目标")
         self.resultLabel.setAlignment(Qt.AlignCenter)
+        self.resultLabel.setWordWrap(True)
         self.leftNodeLabel.setWordWrap(True)
         self.leftNodeLabel.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.logText.setReadOnly(True)
         self.logText.setAcceptRichText(False)
+        self.previewSubtitleLabel.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.recogMethod.setItemText(0, "经典识别")
         self.recogMethod.setItemText(1, "深度识别")
         self.openDetection.setText("显示锁脸框")
@@ -231,69 +257,95 @@ class MainPage(QMainWindow, Ui_System):
         self.setStyleSheet(
             """
             QMainWindow#System {
-                background-color: #07111d;
+                background-color: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #050c11,
+                    stop: 0.42 #0b141a,
+                    stop: 1 #10181f
+                );
             }
             QFrame#leftCard {
-                background-color: #0a1726;
-                border: 1px solid #123049;
-                border-radius: 28px;
+                background-color: #101820;
+                border: 1px solid #273845;
+                border-radius: 32px;
             }
             QFrame#previewCard {
-                background-color: #091724;
-                border: 1px solid #143850;
-                border-radius: 30px;
+                background-color: #0d161d;
+                border: 1px solid #304451;
+                border-radius: 36px;
             }
             QFrame#rightCard {
-                background-color: #0b1828;
-                border: 1px solid #14354d;
-                border-radius: 28px;
+                background-color: #111a22;
+                border: 1px solid #2b404d;
+                border-radius: 32px;
+            }
+            QFrame#samplePanel,
+            QFrame#actionPanel,
+            QFrame#logPanel,
+            QFrame#controlPanel,
+            QFrame#resultPanel,
+            QFrame#previewFooterPanel {
+                background-color: rgba(10, 18, 24, 220);
+                border: 1px solid rgba(79, 110, 124, 120);
+                border-radius: 22px;
             }
             QFrame#accentOrbOne {
-                background-color: rgba(31, 206, 255, 42);
-                border-radius: 60px;
+                background-color: rgba(72, 210, 189, 34);
+                border-radius: 66px;
             }
             QFrame#accentOrbTwo {
-                background-color: rgba(0, 255, 170, 32);
-                border-radius: 48px;
+                background-color: rgba(255, 181, 92, 28);
+                border-radius: 56px;
             }
             QFrame#previewBeamTop,
             QFrame#previewBeamBottom {
-                background-color: rgba(41, 235, 255, 184);
+                background-color: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 rgba(84, 214, 197, 0),
+                    stop: 0.18 rgba(84, 214, 197, 140),
+                    stop: 0.82 rgba(255, 184, 87, 140),
+                    stop: 1 rgba(255, 184, 87, 0)
+                );
                 border-radius: 1px;
             }
             QLabel#label {
-                color: #d7efff;
-                font-size: 26px;
+                color: #f5f7f8;
+                font-size: 30px;
                 font-weight: 700;
                 font-family: "Avenir Next Condensed", "Avenir Next", "PingFang SC";
-                letter-spacing: 2px;
+                letter-spacing: 1px;
             }
             QLabel#subtitleLabel {
-                color: rgba(92, 214, 255, 190);
+                color: #83a8b2;
                 font-size: 12px;
                 font-weight: 600;
                 font-family: "Menlo";
+                letter-spacing: 1px;
             }
             QLabel#logSectionLabel {
-                color: rgba(210, 238, 255, 215);
+                color: #cfdee4;
                 font-size: 13px;
                 font-weight: 600;
                 font-family: "Menlo";
+                letter-spacing: 1px;
             }
             QLabel#previewTitleLabel {
-                color: #d4f4ff;
-                font-size: 24px;
+                color: #f6f7f4;
+                font-size: 28px;
                 font-weight: 700;
                 font-family: "Avenir Next Condensed", "Avenir Next", "PingFang SC";
                 letter-spacing: 1px;
             }
             QLabel#previewSubtitleLabel {
-                color: #7fbad0;
+                color: #d2dde1;
                 font-size: 12px;
                 font-weight: 500;
                 font-family: "Menlo";
+                padding: 0 18px;
             }
             QLabel#cameraBadge {
+                background-color: rgba(16, 30, 38, 230);
+                border: 1px solid rgba(88, 126, 137, 150);
                 border-radius: 15px;
                 font-size: 11px;
                 font-weight: 700;
@@ -303,7 +355,7 @@ class MainPage(QMainWindow, Ui_System):
             }
             QLabel#label_2,
             QLabel#label_3 {
-                color: #d8f2ff;
+                color: #eef4f6;
                 font-size: 18px;
                 font-weight: 700;
                 font-family: "Avenir Next Condensed", "Avenir Next", "PingFang SC";
@@ -311,71 +363,71 @@ class MainPage(QMainWindow, Ui_System):
             }
             QLabel#controlSubtitleLabel,
             QLabel#resultHintLabel {
-                color: #7cb1c9;
+                color: #94adb6;
                 font-size: 12px;
                 font-weight: 500;
                 font-family: "Menlo";
             }
             QLabel#previewMetaLabel {
-                color: rgba(90, 229, 255, 205);
+                color: #90aeb8;
                 font-size: 11px;
                 font-weight: 600;
                 font-family: "Menlo";
                 letter-spacing: 1px;
             }
             QLabel#leftNodeLabel {
-                color: #d7f6ff;
-                background-color: rgba(8, 27, 45, 224);
-                border: 1px solid rgba(47, 149, 191, 122);
+                color: #f4f7f8;
+                background-color: rgba(17, 28, 36, 220);
+                border: 1px solid rgba(73, 114, 131, 145);
                 border-radius: 18px;
                 font-size: 12px;
                 font-weight: 600;
                 font-family: "Avenir Next", "PingFang SC";
-                padding: 10px 12px;
-            }
-            QLabel#sampleStatsLabel {
-                color: #a9dff2;
-                background-color: rgba(7, 24, 38, 196);
-                border: 1px solid rgba(42, 117, 150, 128);
-                border-radius: 14px;
-                font-size: 12px;
-                font-weight: 600;
-                font-family: "Menlo";
                 padding: 8px 10px;
             }
+            QLabel#sampleStatsLabel {
+                color: #8dc6d0;
+                background-color: rgba(10, 19, 26, 212);
+                border: 1px solid rgba(57, 85, 98, 145);
+                border-radius: 16px;
+                font-size: 11px;
+                font-weight: 600;
+                font-family: "Menlo";
+                padding: 6px 10px;
+            }
             QLabel#displayField {
-                background-color: #04111c;
-                border: 1px solid #1b607d;
-                border-radius: 24px;
-                color: #70dfff;
+                background-color: #081117;
+                border: 1px solid #38525f;
+                border-radius: 28px;
+                color: #88a9b4;
                 font-size: 18px;
                 font-weight: 600;
                 font-family: "Avenir Next", "PingFang SC";
-                padding: 18px;
+                padding: 20px;
             }
             QLabel#resultFace {
-                background-color: #06131d;
-                border: 1px solid #16546f;
-                border-radius: 24px;
-                color: #74d8ff;
-                font-size: 14px;
+                background-color: #081117;
+                border: 1px solid #425864;
+                border-radius: 30px;
+                color: #d4e0e4;
+                font-size: 15px;
                 font-weight: 600;
                 font-family: "Menlo";
-                padding: 10px;
+                padding: 12px;
             }
             QLabel#resultLabel {
-                color: #e0f8ff;
-                font-size: 18px;
+                color: #f4f7f8;
+                font-size: 22px;
                 font-weight: 700;
                 font-family: "Avenir Next Condensed", "Avenir Next", "PingFang SC";
             }
             QTextEdit#logText {
-                background-color: rgba(5, 18, 31, 240);
-                border: 1px solid rgba(39, 117, 153, 140);
+                background-color: rgba(8, 15, 20, 238);
+                border: 1px solid rgba(55, 79, 93, 140);
                 border-radius: 18px;
-                color: #86dbff;
+                color: #c4dde4;
                 padding: 12px;
-                selection-background-color: #1b90c2;
+                selection-background-color: #4e8f9a;
                 font-size: 12px;
                 font-family: "Menlo";
             }
@@ -385,7 +437,7 @@ class MainPage(QMainWindow, Ui_System):
                 background: transparent;
             }
             QTextEdit#logText QScrollBar::handle:vertical {
-                background: rgba(84, 225, 255, 97);
+                background: rgba(132, 177, 187, 110);
                 border-radius: 5px;
                 min-height: 28px;
             }
@@ -394,77 +446,78 @@ class MainPage(QMainWindow, Ui_System):
                 height: 0;
             }
             QLineEdit#nameInput {
-                background-color: rgba(5, 20, 33, 235);
-                border: 1px solid rgba(36, 116, 152, 148);
-                border-radius: 16px;
-                color: #dff7ff;
+                background-color: rgba(8, 17, 23, 235);
+                border: 1px solid rgba(71, 102, 116, 165);
+                border-radius: 18px;
+                color: #f4f8f9;
                 padding: 0 14px;
                 font-size: 13px;
                 font-weight: 500;
                 font-family: "Menlo";
             }
             QLineEdit#nameInput:focus {
-                border: 1px solid rgba(63, 233, 255, 242);
+                border: 1px solid rgba(255, 190, 104, 220);
             }
             QPushButton {
                 border: none;
-                border-radius: 16px;
-                font-size: 14px;
+                border-radius: 18px;
+                font-size: 13px;
                 font-weight: 700;
                 font-family: "Menlo";
-                letter-spacing: 1px;
+                letter-spacing: 0.5px;
+                padding: 0 14px;
             }
             QPushButton#switchButton {
-                background-color: #0d5a7b;
-                color: #dff9ff;
+                background-color: #16897f;
+                color: #f4fffc;
             }
             QPushButton#switchButton:hover {
-                background-color: #11709b;
+                background-color: #1ca093;
             }
             QPushButton#startTrainButton {
-                background-color: #123d76;
-                color: #dff5ff;
+                background-color: #355a89;
+                color: #edf5ff;
             }
             QPushButton#startTrainButton:hover {
-                background-color: #175191;
+                background-color: #416ca3;
             }
             QPushButton#imgRegister {
-                background-color: #0e7a63;
-                color: #e6fff8;
+                background-color: #d29647;
+                color: #1d1305;
             }
             QPushButton#imgRegister:hover {
-                background-color: #12957a;
+                background-color: #ebaa54;
             }
             QPushButton#deleteSampleButton {
-                background-color: #75402d;
-                color: #fff0e7;
+                background-color: #8a4c36;
+                color: #fff3ec;
                 font-size: 12px;
             }
             QPushButton#deleteSampleButton:hover {
-                background-color: #8e5039;
+                background-color: #a45d43;
             }
             QPushButton#clearSamplesButton {
-                background-color: #5f2430;
+                background-color: #7a3d4f;
                 color: #ffe6ec;
                 font-size: 12px;
             }
             QPushButton#clearSamplesButton:hover {
-                background-color: #7c3040;
+                background-color: #92495e;
             }
             QPushButton#loadMindSporeFace {
-                background-color: #081b2d;
-                border: 1px solid #1a5f7f;
-                color: #b8f0ff;
+                background-color: rgba(12, 22, 30, 235);
+                border: 1px solid rgba(77, 112, 127, 160);
+                color: #dce9ee;
             }
             QPushButton#loadMindSporeFace:hover {
-                background-color: #0b2238;
+                background-color: rgba(20, 33, 42, 245);
             }
             QPushButton:disabled {
-                background-color: #183042;
-                color: #6f8ea0;
+                background-color: #23343d;
+                color: #6d8792;
             }
             QCheckBox {
-                color: #daf4ff;
+                color: #e0ebef;
                 font-size: 13px;
                 font-weight: 600;
                 font-family: "Avenir Next", "PingFang SC";
@@ -474,22 +527,22 @@ class MainPage(QMainWindow, Ui_System):
                 width: 18px;
                 height: 18px;
                 border-radius: 4px;
-                border: 1px solid #2a7597;
-                background-color: #081421;
+                border: 1px solid #45606d;
+                background-color: #091218;
             }
             QCheckBox::indicator:checked {
-                background-color: #1be0ff;
-                border: 4px solid #081421;
+                background-color: #eab15d;
+                border: 4px solid #091218;
             }
             QCheckBox::indicator:disabled {
-                background-color: #122433;
-                border: 1px solid #27455d;
+                background-color: #16232c;
+                border: 1px solid #31424d;
             }
             QComboBox {
-                background-color: #071625;
-                border: 1px solid #215f7d;
-                border-radius: 16px;
-                color: #dff5ff;
+                background-color: #09151b;
+                border: 1px solid #425b69;
+                border-radius: 18px;
+                color: #edf2f3;
                 padding: 0 14px;
                 font-size: 13px;
                 font-weight: 600;
@@ -500,11 +553,11 @@ class MainPage(QMainWindow, Ui_System):
                 width: 28px;
             }
             QComboBox QAbstractItemView {
-                background-color: #091b2b;
-                border: 1px solid #215f7d;
-                color: #d7f6ff;
-                selection-background-color: #0a8dba;
-                selection-color: #f0fdff;
+                background-color: #101920;
+                border: 1px solid #425b69;
+                color: #edf2f3;
+                selection-background-color: #d99d4d;
+                selection-color: #1d1407;
                 padding: 6px;
             }
             """
@@ -529,6 +582,16 @@ class MainPage(QMainWindow, Ui_System):
             self.previewBeamBottom,
         ):
             widget.lower()
+
+        for widget in (
+            self.samplePanel,
+            self.actionPanel,
+            self.logPanel,
+            self.controlPanel,
+            self.resultPanel,
+            self.previewFooterPanel,
+        ):
+            widget.raise_()
 
         for widget in (
             self.label,
@@ -567,25 +630,37 @@ class MainPage(QMainWindow, Ui_System):
     def clamp(self, value, minimum, maximum):
         return max(minimum, min(maximum, value))
 
+    def wrapped_label_height(self, label, width, horizontal_padding, vertical_padding, minimum_height):
+        content_width = max(32, width - horizontal_padding * 2)
+        text_rect = label.fontMetrics().boundingRect(
+            0,
+            0,
+            content_width,
+            2000,
+            Qt.TextWordWrap,
+            label.text(),
+        )
+        return max(minimum_height, text_rect.height() + vertical_padding * 2)
+
     def layout_chrome(self):
         width = max(self.width(), self.minimumWidth())
         height = max(self.height(), self.minimumHeight())
 
-        margin = self.clamp(int(min(width, height) * 0.02), 12, 24)
-        gap = self.clamp(int(width * 0.014), 12, 20)
+        margin = self.clamp(int(min(width, height) * 0.022), 16, 28)
+        gap = self.clamp(int(width * 0.015), 14, 24)
         card_height = height - margin * 2
 
-        left_width = self.clamp(int(width * 0.19), 210, 270)
-        right_width = self.clamp(int(width * 0.22), 240, 310)
+        left_width = self.clamp(int(width * 0.24), 250, 330)
+        right_width = self.clamp(int(width * 0.26), 280, 350)
         preview_width = width - margin * 2 - gap * 2 - left_width - right_width
 
-        if preview_width < 460:
-            shortage = 460 - preview_width
-            shrink_left = min(shortage // 2, left_width - 190)
-            left_width -= max(0, shrink_left)
-            shortage -= max(0, shrink_left)
-            shrink_right = min(shortage, right_width - 220)
+        if preview_width < 500:
+            shortage = 500 - preview_width
+            shrink_right = min(shortage // 2, right_width - 252)
             right_width -= max(0, shrink_right)
+            shortage -= max(0, shrink_right)
+            shrink_left = min(shortage, left_width - 228)
+            left_width -= max(0, shrink_left)
             preview_width = width - margin * 2 - gap * 2 - left_width - right_width
 
         left_x = margin
@@ -597,15 +672,15 @@ class MainPage(QMainWindow, Ui_System):
         self.previewCard.setGeometry(preview_x, top_y, preview_width, card_height)
         self.rightCard.setGeometry(right_x, top_y, right_width, card_height)
 
-        orb_one_size = self.clamp(int(preview_width * 0.16), 96, 136)
+        orb_one_size = self.clamp(int(preview_width * 0.16), 108, 144)
         self.accentOrbOne.setGeometry(
             preview_x + preview_width - orb_one_size + 24,
-            top_y - 18,
+            top_y - 12,
             orb_one_size,
             orb_one_size,
         )
 
-        orb_two_size = self.clamp(int(right_width * 0.36), 86, 116)
+        orb_two_size = self.clamp(int(right_width * 0.34), 96, 124)
         self.accentOrbTwo.setGeometry(
             right_x + right_width - orb_two_size + 18,
             top_y + card_height - orb_two_size + 14,
@@ -613,53 +688,106 @@ class MainPage(QMainWindow, Ui_System):
             orb_two_size,
         )
 
-        left_pad = self.clamp(int(left_width * 0.1), 18, 26)
+        left_pad = self.clamp(int(left_width * 0.085), 20, 28)
         left_inner_width = left_width - left_pad * 2
-        button_height = self.clamp(int(card_height * 0.075), 36, 42)
-        field_height = self.clamp(int(card_height * 0.08), 40, 46)
-        hint_height = self.clamp(int(card_height * 0.08), 44, 56)
-        stats_height = self.clamp(int(card_height * 0.055), 34, 42)
-        control_gap = self.clamp(int(card_height * 0.016), 10, 14)
-        section_gap = self.clamp(int(card_height * 0.022), 14, 22)
+        button_height = self.clamp(int(card_height * 0.055), 36, 40)
+        field_height = self.clamp(int(card_height * 0.056), 38, 42)
+        section_gap = self.clamp(int(card_height * 0.02), 12, 18)
+        panel_pad = 16
+        sample_panel_pad = 12
 
-        self.label.setGeometry(left_x + left_pad, top_y + 18, left_inner_width, 30)
-        self.subtitleLabel.setGeometry(left_x + left_pad, top_y + 52, left_inner_width, 20)
-        self.logSectionLabel.setGeometry(left_x + left_pad, top_y + 86, left_inner_width, 18)
+        self.label.setGeometry(left_x + left_pad, top_y + 24, left_inner_width, 32)
+        self.subtitleLabel.setGeometry(left_x + left_pad, top_y + 58, left_inner_width, 20)
 
-        switch_y = top_y + card_height - left_pad - button_height
-        manage_y = switch_y - control_gap - button_height
-        train_y = manage_y - control_gap - button_height
-        register_y = train_y - control_gap - button_height
-        name_y = register_y - control_gap - field_height
-        stats_y = name_y - control_gap - stats_height
-        hint_y = stats_y - control_gap - hint_height
+        panel_stack_top = top_y + 104
+        panel_stack_bottom = top_y + card_height - left_pad
+        panel_stack_height = panel_stack_bottom - panel_stack_top
+        sample_info_width = left_inner_width - sample_panel_pad * 2
+        hint_height = self.wrapped_label_height(
+            self.leftNodeLabel,
+            sample_info_width,
+            horizontal_padding=20,
+            vertical_padding=8,
+            minimum_height=44,
+        )
+        stats_height = self.wrapped_label_height(
+            self.sampleStatsLabel,
+            sample_info_width,
+            horizontal_padding=20,
+            vertical_padding=6,
+            minimum_height=32,
+        )
+        sample_panel_needed = sample_panel_pad * 2 + hint_height + 8 + stats_height + 8 + field_height
+        sample_panel_height = self.clamp(max(sample_panel_needed, int(panel_stack_height * 0.33)), 168, 208)
+        action_panel_height = self.clamp(int(panel_stack_height * 0.35), 192, 228)
+        log_panel_height = panel_stack_height - sample_panel_height - action_panel_height - section_gap * 2
+        if log_panel_height < 144:
+            shortage = 144 - log_panel_height
+            reduce_action = min(shortage, action_panel_height - 192)
+            action_panel_height -= reduce_action
+            shortage -= reduce_action
+            reduce_sample = min(shortage, sample_panel_height - sample_panel_needed)
+            sample_panel_height -= reduce_sample
+            log_panel_height = panel_stack_height - sample_panel_height - action_panel_height - section_gap * 2
 
-        self.leftNodeLabel.setGeometry(left_x + left_pad, hint_y, left_inner_width, hint_height)
-        self.sampleStatsLabel.setGeometry(left_x + left_pad, stats_y, left_inner_width, stats_height)
-        self.nameInput.setGeometry(left_x + left_pad, name_y, left_inner_width, field_height)
-        self.imgRegister.setGeometry(left_x + left_pad, register_y, left_inner_width, button_height)
-        self.startTrainButton.setGeometry(left_x + left_pad, train_y, left_inner_width, button_height)
-        manage_gap = self.clamp(int(left_inner_width * 0.05), 8, 12)
-        manage_width = (left_inner_width - manage_gap) // 2
-        self.deleteSampleButton.setGeometry(left_x + left_pad, manage_y, manage_width, button_height)
+        sample_y = panel_stack_top
+        action_y = sample_y + sample_panel_height + section_gap
+        log_y = action_y + action_panel_height + section_gap
+
+        panel_x = left_x + left_pad
+        self.samplePanel.setGeometry(panel_x, sample_y, left_inner_width, sample_panel_height)
+        self.actionPanel.setGeometry(panel_x, action_y, left_inner_width, action_panel_height)
+        self.logPanel.setGeometry(panel_x, log_y, left_inner_width, log_panel_height)
+
+        self.leftNodeLabel.setGeometry(
+            panel_x + sample_panel_pad,
+            sample_y + sample_panel_pad,
+            sample_info_width,
+            hint_height,
+        )
+        self.sampleStatsLabel.setGeometry(
+            panel_x + sample_panel_pad,
+            sample_y + sample_panel_pad + hint_height + 8,
+            sample_info_width,
+            stats_height,
+        )
+        self.nameInput.setGeometry(
+            panel_x + sample_panel_pad,
+            sample_y + sample_panel_height - sample_panel_pad - field_height,
+            sample_info_width,
+            field_height,
+        )
+
+        register_y = action_y + panel_pad
+        train_y = register_y + button_height + 10
+        manage_y = train_y + button_height + 10
+        switch_y = action_y + action_panel_height - panel_pad - button_height
+        self.imgRegister.setGeometry(panel_x + panel_pad, register_y, left_inner_width - panel_pad * 2, button_height)
+        self.startTrainButton.setGeometry(panel_x + panel_pad, train_y, left_inner_width - panel_pad * 2, button_height)
+        manage_gap = self.clamp(int(left_inner_width * 0.06), 10, 14)
+        manage_width = (left_inner_width - panel_pad * 2 - manage_gap) // 2
+        self.deleteSampleButton.setGeometry(panel_x + panel_pad, manage_y, manage_width, button_height)
         self.clearSamplesButton.setGeometry(
-            left_x + left_pad + manage_width + manage_gap,
+            panel_x + panel_pad + manage_width + manage_gap,
             manage_y,
-            left_inner_width - manage_width - manage_gap,
+            left_inner_width - panel_pad * 2 - manage_width - manage_gap,
             button_height,
         )
-        self.switchButton.setGeometry(left_x + left_pad, switch_y, left_inner_width, button_height)
+        self.switchButton.setGeometry(panel_x + panel_pad, switch_y, left_inner_width - panel_pad * 2, button_height)
 
-        log_top = top_y + 114
-        log_bottom = hint_y - section_gap
-        log_height = max(0, log_bottom - log_top)
-        self.logText.setGeometry(left_x + left_pad, log_top, left_inner_width, log_height)
+        self.logSectionLabel.setGeometry(panel_x + panel_pad, log_y + panel_pad, left_inner_width - panel_pad * 2, 18)
+        self.logText.setGeometry(
+            panel_x + panel_pad,
+            log_y + panel_pad + 26,
+            left_inner_width - panel_pad * 2,
+            log_panel_height - panel_pad * 2 - 26,
+        )
 
-        preview_pad = self.clamp(int(preview_width * 0.04), 22, 34)
+        preview_pad = self.clamp(int(preview_width * 0.04), 24, 36)
         preview_inner_width = preview_width - preview_pad * 2
-        header_top = top_y + 20
-        title_width = self.clamp(int(preview_inner_width * 0.36), 200, 260)
-        badge_width = self.clamp(int(preview_width * 0.24), 164, 196)
+        header_top = top_y + 24
+        title_width = self.clamp(int(preview_inner_width * 0.38), 224, 296)
+        badge_width = self.clamp(int(preview_width * 0.23), 156, 196)
         badge_height = 32
         badge_x = preview_x + preview_width - preview_pad - badge_width
 
@@ -668,42 +796,71 @@ class MainPage(QMainWindow, Ui_System):
 
         meta_x = preview_x + preview_pad + title_width + 18
         meta_width = max(0, badge_x - meta_x - 20)
-        self.previewMetaLabel.setVisible(meta_width > 150)
-        if meta_width > 150:
+        self.previewMetaLabel.setVisible(meta_width > 140)
+        if meta_width > 140:
             self.previewMetaLabel.setGeometry(meta_x, header_top, meta_width, 28)
 
-        self.previewSubtitleLabel.setGeometry(preview_x + preview_pad, header_top + 34, preview_inner_width, 18)
-
         display_x = preview_x + preview_pad
-        display_y = top_y + 92
-        display_height = max(260, card_height - 122)
+        display_y = top_y + 102
+        footer_height = self.clamp(int(card_height * 0.085), 52, 62)
+        footer_y = top_y + card_height - preview_pad - footer_height
+        display_height = max(280, footer_y - display_y - 20)
         self.displayField.setGeometry(display_x, display_y, preview_inner_width, display_height)
+
+        self.previewFooterPanel.setGeometry(display_x, footer_y, preview_inner_width, footer_height)
+        self.previewSubtitleLabel.setGeometry(
+            display_x + 18,
+            footer_y + (footer_height - 18) // 2,
+            preview_inner_width - 36,
+            18,
+        )
 
         beam_x = display_x + 18
         beam_width = max(60, preview_inner_width - 36)
-        self.previewBeamTop.setGeometry(beam_x, display_y - 14, beam_width, 2)
+        self.previewBeamTop.setGeometry(beam_x, display_y - 12, beam_width, 2)
         self.previewBeamBottom.setGeometry(beam_x, display_y + display_height + 12, beam_width, 2)
         self.previewMetaLabel.setText(f"画面 {preview_inner_width}×{display_height}  /  实时视频流")
 
-        right_pad = self.clamp(int(right_width * 0.1), 20, 28)
+        right_pad = self.clamp(int(right_width * 0.09), 22, 30)
         right_inner_width = right_width - right_pad * 2
-        combo_height = 38
+        combo_height = 40
 
         self.label_2.setGeometry(right_x + right_pad, top_y + 24, right_inner_width, 24)
-        self.controlSubtitleLabel.setGeometry(right_x + right_pad, top_y + 52, right_inner_width, 18)
-        self.openDetection.setGeometry(right_x + right_pad, top_y + 88, right_inner_width, 22)
-        self.detectMethod.setGeometry(right_x + right_pad, top_y + 116, right_inner_width, combo_height)
-        self.openRecognition.setGeometry(right_x + right_pad, top_y + 170, right_inner_width, 22)
-        self.recogMethod.setGeometry(right_x + right_pad, top_y + 198, right_inner_width, combo_height)
-        self.loadMindSporeFace.setGeometry(right_x + right_pad, top_y + 248, right_inner_width, combo_height)
+        self.controlSubtitleLabel.setGeometry(right_x + right_pad, top_y + 56, right_inner_width, 34)
 
-        result_face_size = self.clamp(right_inner_width - 34, 118, 156)
-        result_face_x = right_x + (right_width - result_face_size) // 2
-        result_face_y = top_y + card_height - right_pad - result_face_size - 34
-        self.label_3.setGeometry(right_x + right_pad, result_face_y - 54, right_inner_width, 24)
-        self.resultHintLabel.setGeometry(right_x + right_pad, result_face_y - 26, right_inner_width, 18)
+        control_panel_y = top_y + 104
+        control_panel_height = self.clamp(int(card_height * 0.34), 214, 248)
+        self.controlPanel.setGeometry(right_x + right_pad, control_panel_y, right_inner_width, control_panel_height)
+        self.openDetection.setGeometry(right_x + right_pad + 18, control_panel_y + 18, right_inner_width - 36, 22)
+        self.detectMethod.setGeometry(right_x + right_pad + 18, control_panel_y + 48, right_inner_width - 36, combo_height)
+        self.openRecognition.setGeometry(right_x + right_pad + 18, control_panel_y + 108, right_inner_width - 36, 22)
+        self.recogMethod.setGeometry(right_x + right_pad + 18, control_panel_y + 138, right_inner_width - 36, combo_height)
+        self.loadMindSporeFace.setGeometry(
+            right_x + right_pad + 18,
+            control_panel_y + control_panel_height - 18 - combo_height,
+            right_inner_width - 36,
+            combo_height,
+        )
+
+        result_panel_y = control_panel_y + control_panel_height + section_gap
+        result_panel_height = top_y + card_height - right_pad - result_panel_y
+        self.resultPanel.setGeometry(right_x + right_pad, result_panel_y, right_inner_width, result_panel_height)
+        self.label_3.setGeometry(right_x + right_pad + 18, result_panel_y + 18, right_inner_width - 36, 24)
+        self.resultHintLabel.setGeometry(right_x + right_pad + 18, result_panel_y + 48, right_inner_width - 36, 34)
+
+        result_label_height = 42
+        result_content_bottom = result_panel_y + result_panel_height - 18
+        result_face_max_height = result_content_bottom - (result_panel_y + 96) - 14 - result_label_height
+        result_face_size = self.clamp(int(min(right_inner_width - 52, result_face_max_height)), 142, 198)
+        result_face_x = right_x + right_pad + (right_inner_width - result_face_size) // 2
+        result_face_y = result_panel_y + 96
         self.resultFace.setGeometry(result_face_x, result_face_y, result_face_size, result_face_size)
-        self.resultLabel.setGeometry(right_x + right_pad, result_face_y + result_face_size + 10, right_inner_width, 26)
+        self.resultLabel.setGeometry(
+            right_x + right_pad + 18,
+            result_face_y + result_face_size + 14,
+            right_inner_width - 36,
+            result_label_height,
+        )
 
     def apply_shadow(self, widget, blur_radius, offset_y):
         shadow = QGraphicsDropShadowEffect(self)
@@ -711,6 +868,49 @@ class MainPage(QMainWindow, Ui_System):
         shadow.setOffset(0, offset_y)
         shadow.setColor(QColor(15, 204, 255, 34))
         widget.setGraphicsEffect(shadow)
+
+    def env_flag(self, name, default):
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    def start_startup_remote_sync(self):
+        if not self.env_flag("FACE_SERVICE_AUTO_SYNC_ON_START", True):
+            self.putLog("启动检查：已关闭远端样本自动同步")
+            return
+        if self.startup_remote_sync_running:
+            return
+
+        self.startup_remote_sync_running = True
+        self.putLog("启动检查：正在检查远端服务并同步样本...")
+        self.startup_remote_sync_thread = threading.Thread(
+            target=self.run_startup_remote_sync,
+            daemon=True,
+        )
+        self.startup_remote_sync_thread.start()
+
+    def run_startup_remote_sync(self):
+        try:
+            summary = reconcile_remote_samples(
+                dataset_root=self.sample_root,
+                base_url=os.getenv("FACE_SERVICE_BASE_URL", "http://127.0.0.1:18000"),
+                manifest_path=os.path.join("temp", "remote_sync_manifest.json"),
+                timeout=float(os.getenv("FACE_SERVICE_AUTO_SYNC_TIMEOUT", "8")),
+                keep_remote_missing=self.env_flag("FACE_SERVICE_AUTO_SYNC_KEEP_REMOTE_MISSING", False),
+                progress=self.putLog,
+            )
+            if summary.ok:
+                if summary.changed:
+                    self.putLog(f"启动检查完成：远端样本已同步，{summary.summary_line()}")
+                else:
+                    self.putLog(f"启动检查完成：远端样本已是最新，{summary.summary_line()}")
+            else:
+                self.putLog(f"启动检查失败：{summary.error}")
+        except Exception as exc:
+            self.putLog(f"启动检查失败：{exc}")
+        finally:
+            self.startup_remote_sync_running = False
 
     def animate_intro(self):
         self._animations.clear()
@@ -755,14 +955,14 @@ class MainPage(QMainWindow, Ui_System):
         if self.camera_connecting:
             self.leftNodeLabel.setText("步骤 1 / 正在连接摄像头\n请稍候...")
         elif not self.camera_ready:
-            self.leftNodeLabel.setText("步骤 1 / 先连接摄像头\n连接后可直接开始识别或采集")
+            self.leftNodeLabel.setText("步骤 1 / 先连接摄像头\n随后可开始识别或采集")
         elif not self.openDetection.isChecked():
-            self.leftNodeLabel.setText("步骤 2 / 可直接开始识别\n系统会自动锁定人脸，也可先手动显示锁脸框")
+            self.leftNodeLabel.setText("步骤 2 / 可开始识别\n系统会自动锁定人脸")
         elif not self.openRecognition.isChecked():
             if classic_ready:
-                self.leftNodeLabel.setText("步骤 3 / 经典模型已就绪\n现在可以直接开始识别，或继续采集新样本")
+                self.leftNodeLabel.setText("步骤 3 / 经典模型已就绪\n现在可直接识别或继续采集")
             else:
-                self.leftNodeLabel.setText("步骤 3 / 可采集当前人脸\n如需认出姓名，直接点开始自动识别")
+                self.leftNodeLabel.setText("步骤 3 / 可采集当前人脸\n也可直接开启自动识别")
         else:
             self.leftNodeLabel.setText("流程已就绪\n系统正在自动锁脸并实时识别")
 
@@ -811,6 +1011,7 @@ class MainPage(QMainWindow, Ui_System):
             else:
                 self.resultHintLabel.setText("识别命中后，会在这里显示目标快照")
 
+        self.layout_chrome()
         self.sync_controls_state()
 
     def sync_controls_state(self):
@@ -1149,7 +1350,11 @@ class MainPage(QMainWindow, Ui_System):
             self.reset_result_panel(label_text=result, face_text="目标目录为空")
             return
 
-        resPic = cv2.imread(os.path.join(result_dir, picList[0]))
+        latest_pic = max(
+            picList,
+            key=lambda pic: os.path.getmtime(os.path.join(result_dir, pic)),
+        )
+        resPic = cv2.imread(os.path.join(result_dir, latest_pic))
         if resPic is None:
             self.reset_result_panel(label_text=result, face_text="图像读取失败")
             return
@@ -1185,10 +1390,12 @@ class MainPage(QMainWindow, Ui_System):
         if not self.camera_ready:
             self.putLog("请先连接摄像头")
             return
-        name = self.nameInput.text()
+        name = self.nameInput.text().strip()
         if not name:
             self.putLog("请输入姓名")
             return
+        if name != self.nameInput.text():
+            self.nameInput.setText(name)
         self.putLog("开始采集当前人脸")
         self.putLog(f"姓名: {name}")
         self.putLog("请稍后...")
@@ -1208,4 +1415,4 @@ class MainPage(QMainWindow, Ui_System):
     def show_mindspore_status(self):
         service_url = os.getenv("FACE_SERVICE_BASE_URL", "http://127.0.0.1:18000")
         self.putLog(f"当前深度识别服务地址: {service_url}")
-        self.putLog("说明：默认地址是本机 SSH 隧道 127.0.0.1:18000，深度识别走远端 embedding 服务")
+        self.putLog("说明：默认地址通常指向本机转发端口，深度识别由远端服务处理")
