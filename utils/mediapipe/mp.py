@@ -1,8 +1,6 @@
 import math
 from typing import Tuple, Union
 import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
 import numpy as np
 import cv2
 
@@ -22,14 +20,31 @@ class MediaPipe:
         self.TEXT_COLOR = (255, 0, 0)  # red
 
         self.options = self.FaceDetectorOptions(
-            base_options=self.BaseOptions(model_asset_path=self.model_path),
-            running_mode=self.VisionRunningMode.IMAGE)
+            base_options=self.BaseOptions(
+                model_asset_path=self.model_path,
+                delegate=self.BaseOptions.Delegate.CPU,
+            ),
+            running_mode=self.VisionRunningMode.IMAGE,
+            min_detection_confidence=0.35,
+            min_suppression_threshold=0.25,
+        )
+        self.detector = None
+
+    def ensure_detector(self):
+        if self.detector is None:
+            self.detector = self.FaceDetector.create_from_options(self.options)
+        return self.detector
 
     def detect_face(self, frame):
-        with self.FaceDetector.create_from_options(self.options) as detector:
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-            face_detector_result = detector.detect(mp_image)
-            return face_detector_result
+        detector = self.ensure_detector()
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        return detector.detect(mp_image)
+
+    def close(self):
+        if getattr(self, "detector", None) is not None:
+            self.detector.close()
+            self.detector = None
 
     def crop_face(self, frame, face_detector_result):
         face = None

@@ -1,28 +1,56 @@
+import hashlib
+import json
 import os.path
+import sys
 import threading
-from queue import Queue
+from queue import Empty, Full, Queue
 
 import PIL
 import cv2
-import mindspore as ms
-# MindFace
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
-from utils.mindface.recognition.models import iresnet50, iresnet100, get_mbf, vit_t, vit_s, vit_b, vit_l
-from mindspore import Tensor, context
-from mindspore.train.serialization import load_checkpoint, load_param_into_net
 
 from store.config import ConfigStore
 from utils.common import singleton
-from utils.mindface.detection.models import RetinaFace, resnet50, mobilenet025
-from utils.mindface.detection.runner import DetectionEngine, read_yaml
-from utils.mindface.detection.utils import prior_box
 from utils.vision import VisionTools, draw_rectangle, draw_text
 from utils.mediapipe.mp import MediaPipe as MP
 import multiprocessing
 import requests
 from requests_toolbelt import MultipartEncoder
 from time import sleep
+
+FACE_SERVICE_BASE_URL = os.getenv('FACE_SERVICE_BASE_URL', 'http://127.0.0.1:18000').rstrip('/')
+
+try:
+    import mindspore as ms
+    from mindspore import Tensor, context
+    from mindspore.train.serialization import load_checkpoint, load_param_into_net
+    from utils.mindface.detection.models import RetinaFace, resnet50, mobilenet025
+    from utils.mindface.detection.runner import DetectionEngine, read_yaml
+    from utils.mindface.detection.utils import prior_box
+    from utils.mindface.recognition.models import iresnet50, iresnet100, get_mbf, vit_t, vit_s, vit_b, vit_l
+
+    MINDSPORE_AVAILABLE = True
+except ImportError:
+    ms = None
+    Tensor = None
+    context = None
+    load_checkpoint = None
+    load_param_into_net = None
+    RetinaFace = None
+    resnet50 = None
+    mobilenet025 = None
+    DetectionEngine = None
+    read_yaml = None
+    prior_box = None
+    iresnet50 = None
+    iresnet100 = None
+    get_mbf = None
+    vit_t = None
+    vit_s = None
+    vit_b = None
+    vit_l = None
+    MINDSPORE_AVAILABLE = False
 
 
 class VisionService(QThread):
@@ -31,32 +59,60 @@ class VisionService(QThread):
     """
     resultSignal = pyqtSignal(str)  # 识别结果信号状态
     registerResSignal = pyqtSignal(str)  # 注册结果信号状态
+    cameraStatusSignal = pyqtSignal(bool, str)  # 摄像头状态
 
     def __init__(self, store):
         super(VisionService, self).__init__()
         self.all_queues = {
-            'display': Queue(),
-            'video': Queue(),
+            'display': Queue(maxsize=1),
+            'video': Queue(maxsize=1),
         }
         self.isRunning = True
         self.config = store
-        self.video_stream_in = ReadCameraThread(self.all_queues, self.resultSignal, self.registerResSignal, 0)
+        self.classicFaceRecognizer = ClassicFaceRecognizer()
+        self.video_stream_in = None
+        self.recogThread = RecogThread(self.config.recogQueue, self.resultSignal,
+                                       self.classicFaceRecognizer,
+                                       None)
+        self.recogThread.start()
+        self.registerThread = RegisterThread(self.registerResSignal)
+        self.registerThread.start()
 
     def close_camera(self):
         """
         close camera and release resources
         """
+        if self.video_stream_in is None:
+            self.config.set_config('camera_on', False)
+            self.cameraStatusSignal.emit(False, '摄像头已关闭')
+            return
+        if not self.video_stream_in.is_alive():
+            self.video_stream_in = None
+            self.config.set_config('camera_on', False)
+            self.cameraStatusSignal.emit(False, '摄像头已关闭')
+            return
         self.video_stream_in.stop_read_camera()
-        self.config.set_config('camera_on', False)
 
     def start_camera(self):
         """
         start camera
         """
+        if self.video_stream_in is not None and self.video_stream_in.is_alive():
+            return False
+        self.video_stream_in = ReadCameraThread(
+            self.all_queues,
+            self.resultSignal,
+            self.registerResSignal,
+            self.cameraStatusSignal,
+            0,
+        )
         self.video_stream_in.start()
-        self.config.set_config('camera_on', True)
+        return True
 
     def vision_face_register(self, name):
+        if self.video_stream_in is None:
+            self.registerResSignal.emit('注册失败')
+            return
         self.video_stream_in.register_face_inner(name)
 
 
@@ -70,90 +126,339 @@ class ReadCameraThread(threading.Thread):
     摄像头读取线程
     """
 
-    def __init__(self, video_queue, resultSignal, registerResultSignal, camera_id=0):
+    def __init__(self, video_queue, resultSignal, registerResultSignal, cameraStatusSignal, camera_id=0):
         super(ReadCameraThread).__init__()
         threading.Thread.__init__(self)
-        self.read_capture = cv2.VideoCapture(camera_id)
-        # limit fps 30
-        self.read_capture.set(cv2.CAP_PROP_FPS, 30)
-        self.read_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.read_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.camera_id = camera_id
+        self.read_capture = None
         self.video_queue = video_queue
         self.resultSignal = resultSignal
         self.registerResultSignal = registerResultSignal
+        self.cameraStatusSignal = cameraStatusSignal
         self.vision_tools = VisionTools()
         self.running = True
         self.config = ConfigStore()
         self.recogQueue = self.config.recogQueue
         self.registerQueue = self.config.registerQueue
         self.mindface = None
+        self.mindface_failed = False
         self.detect_config = {}
         self.classicFaceRecognizer = ClassicFaceRecognizer()
-        self.recogThread = None
         self.mp = MP()
         self.current_face = None
         self.current_frame = None
+        self.last_detected_face = None
+        self.missed_face_frames = 0
+        self.max_missed_face_frames = 8
+        self.mp_failed = False
 
     def run(self):
-        self.mindfaceInit()
-        self.recogThread = RecogThread(self.recogQueue, self.resultSignal,
-                                       self.classicFaceRecognizer,
-                                       self.mindface)
-        self.recogThread.start()
-        self.registerThread = RegisterThread(self.registerResultSignal)
-        self.registerThread.start()
-        if not self.read_capture.isOpened():
-            print('未检测到摄像头')
-            exit(0)
+        self.read_capture, status_message = self.open_capture()
+        if self.read_capture is None or not self.read_capture.isOpened():
+            self.cameraStatusSignal.emit(False, status_message)
+            return
+
+        self.cameraStatusSignal.emit(True, status_message)
 
         while self.read_capture.isOpened() and self.running:
             ret, frame = self.read_capture.read()
             res = None
-            faces = None
-            if not ret:
+            faces = []
+            if not ret or frame is None:
+                if self.running:
+                    self.cameraStatusSignal.emit(False, '摄像头读取失败，请重试')
                 break
             self.current_frame = frame
             if self.config.get_config('face_detect'):
+                res = frame.copy()
                 if self.config.get_config('detect_method') == self.config.detect_methods_mapper['classic']:
-                    faces = self.classicFaceRecognizer.detect_face(frame)
-                    res = frame.copy()
-                    for face in faces:
-                        draw_rectangle(res, face)
-                    pass
+                    detected_faces = self.classicFaceRecognizer.detect_face(frame)
+                    faces = self.normalize_faces(detected_faces, frame.shape)
                 if self.config.get_config('detect_method') == self.config.detect_methods_mapper['mediapipe']:
-                    faces = self.mp.detect_face(frame)
-                    res = self.mp.visualize(frame, faces)
-                    faces = self.mp.transform_result(faces)
-                    pass
+                    try:
+                        detected_faces = self.mp.transform_result(self.mp.detect_face(frame))
+                        faces = self.normalize_faces(detected_faces, frame.shape)
+                        self.mp_failed = False
+                    except Exception:
+                        self.mp_failed = True
+                        draw_text(res, '轻量检测暂不可用', 10, 30)
+                        faces = []
                 if self.config.get_config('detect_method') == self.config.detect_methods_mapper['mindspore']:
-                    faces = self.mindfaceFaceDetect(frame)
-                    res = frame.copy()
-                    for face in faces:
-                        draw_rectangle(res, face)
-                    pass
-                if len(faces) > 0:
-                    self.current_face = faces[0]
+                    if self.mindface is None and MINDSPORE_AVAILABLE and not self.mindface_failed:
+                        try:
+                            self.mindfaceInit()
+                        except Exception:
+                            self.mindface_failed = True
+                    if self.mindface is None:
+                        draw_text(res, 'MindSpore 不可用', 10, 30)
+                        faces = []
+                    else:
+                        detected_faces = self.mindfaceFaceDetect(frame)
+                        faces = self.normalize_faces(detected_faces, frame.shape)
+
+                faces = self.stabilize_faces(faces)
+                for face in faces:
+                    draw_rectangle(res, face)
+            else:
+                self.current_face = None
+                self.last_detected_face = None
+                self.missed_face_frames = 0
+
             if self.config.get_config('recog_open') and faces is not None and len(faces) > 0:
                 face_img = self.vision_tools.cut_face(frame, faces[0])
                 if self.recogQueue.empty():
                     self.recogQueue.put(face_img)
             if frame is not None:
-                self.video_queue['video'].put(frame)
+                self.push_latest_frame('video', frame)
             if res is not None:
-                self.video_queue['display'].put(res)
+                self.push_latest_frame('display', res)
             else:
-                self.video_queue['display'].put(frame)
+                self.push_latest_frame('display', frame)
 
-        self.read_capture.release()
+        if self.read_capture is not None:
+            self.read_capture.release()
+            self.read_capture = None
+        self.mp.close()
         cv2.destroyAllWindows()
+        self.current_frame = None
+        self.current_face = None
+        if not self.running:
+            self.cameraStatusSignal.emit(False, '摄像头已关闭')
+
+    def open_capture(self):
+        candidate_ids = []
+        for camera_id in (self.camera_id, 0, 1, 2, 3):
+            if camera_id not in candidate_ids:
+                candidate_ids.append(camera_id)
+
+        candidate_backends = []
+        if sys.platform == 'darwin':
+            for backend_name in ('CAP_AVFOUNDATION', 'CAP_ANY'):
+                backend = getattr(cv2, backend_name, None)
+                if backend is not None and backend not in candidate_backends:
+                    candidate_backends.append(backend)
+        elif sys.platform.startswith('win'):
+            for backend_name in ('CAP_MSMF', 'CAP_DSHOW', 'CAP_ANY'):
+                backend = getattr(cv2, backend_name, None)
+                if backend is not None and backend not in candidate_backends:
+                    candidate_backends.append(backend)
+        else:
+            for backend_name in ('CAP_V4L2', 'CAP_ANY'):
+                backend = getattr(cv2, backend_name, None)
+                if backend is not None and backend not in candidate_backends:
+                    candidate_backends.append(backend)
+
+        attempts = []
+        for camera_id in candidate_ids:
+            for backend in candidate_backends:
+                capture = cv2.VideoCapture(camera_id, backend)
+                backend_name = self.backend_name(backend)
+                if not capture.isOpened():
+                    attempts.append(f'{camera_id}:{backend_name}:open-failed')
+                    capture.release()
+                    continue
+
+                capture.set(cv2.CAP_PROP_FPS, 30)
+                capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+                frame = None
+                frame_ready = False
+                for _ in range(8):
+                    ret, frame = capture.read()
+                    if ret and frame is not None:
+                        frame_ready = True
+                        break
+                    sleep(0.08)
+
+                if frame_ready:
+                    self.push_latest_frame('display', frame)
+                    self.push_latest_frame('video', frame)
+                    return capture, f'摄像头已连接：设备 {camera_id} / 后端 {backend_name}'
+
+                attempts.append(f'{camera_id}:{backend_name}:read-failed')
+                capture.release()
+
+        attempts_text = '，'.join(attempts[:6]) if attempts else '没有可尝试的摄像头后端'
+        return None, f'未检测到可用摄像头，已尝试 {attempts_text}'
+
+    def backend_name(self, backend):
+        backend_names = {
+            getattr(cv2, 'CAP_ANY', -1): '默认',
+            getattr(cv2, 'CAP_AVFOUNDATION', -2): 'AVFoundation',
+            getattr(cv2, 'CAP_MSMF', -3): 'MSMF',
+            getattr(cv2, 'CAP_DSHOW', -4): 'DirectShow',
+            getattr(cv2, 'CAP_V4L2', -5): 'V4L2',
+        }
+        return backend_names.get(backend, str(backend))
+
+    def push_latest_frame(self, queue_name, frame):
+        target_queue = self.video_queue[queue_name]
+        if target_queue.full():
+            try:
+                target_queue.get_nowait()
+            except Empty:
+                pass
+        try:
+            target_queue.put_nowait(frame)
+        except Full:
+            pass
 
     def stop_read_camera(self):
         self.running = False
 
+    def normalize_face_rect(self, face, frame_shape, expand_ratio=0.12):
+        if face is None:
+            return None
+
+        try:
+            x, y, w, h = [int(value) for value in face]
+        except (TypeError, ValueError):
+            return None
+
+        if w <= 0 or h <= 0:
+            return None
+
+        frame_height, frame_width = frame_shape[:2]
+        pad_x = int(w * expand_ratio)
+        pad_y = int(h * expand_ratio)
+
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(frame_width, x + w + pad_x)
+        y2 = min(frame_height, y + h + pad_y)
+
+        clipped_w = x2 - x1
+        clipped_h = y2 - y1
+        if clipped_w <= 0 or clipped_h <= 0:
+            return None
+
+        return x1, y1, clipped_w, clipped_h
+
+    def select_best_face(self, faces, frame_shape):
+        normalized_faces = []
+        face_iterable = faces if faces is not None else []
+        for face in face_iterable:
+            normalized_face = self.normalize_face_rect(face, frame_shape)
+            if normalized_face is not None:
+                normalized_faces.append(normalized_face)
+
+        if not normalized_faces:
+            return None
+
+        return max(normalized_faces, key=lambda item: item[2] * item[3])
+
+    def normalize_faces(self, faces, frame_shape):
+        normalized_faces = []
+        face_iterable = faces if faces is not None else []
+        for face in face_iterable:
+            normalized_face = self.normalize_face_rect(face, frame_shape)
+            if normalized_face is not None:
+                normalized_faces.append(normalized_face)
+
+        normalized_faces.sort(key=lambda item: item[2] * item[3], reverse=True)
+        return normalized_faces
+
+    def stabilize_faces(self, faces):
+        if faces:
+            self.current_face = faces[0]
+            self.last_detected_face = faces[0]
+            self.missed_face_frames = 0
+            return faces
+
+        if self.last_detected_face is not None and self.missed_face_frames < self.max_missed_face_frames:
+            self.missed_face_frames += 1
+            self.current_face = self.last_detected_face
+            return [self.last_detected_face]
+
+        self.current_face = None
+        self.last_detected_face = None
+        self.missed_face_frames = 0
+        return []
+
+    def detect_faces_by_method(self, frame, method_name):
+        if method_name == 'classic':
+            faces = self.classicFaceRecognizer.detect_face(frame)
+            if faces is None or len(faces) == 0:
+                return []
+            return [tuple(face) for face in faces]
+
+        if method_name == 'mediapipe':
+            try:
+                detection_result = self.mp.detect_face(frame)
+            except Exception:
+                return []
+            return self.mp.transform_result(detection_result)
+
+        if method_name == 'mindspore':
+            if not MINDSPORE_AVAILABLE or self.mindface_failed:
+                return []
+            if self.mindface is None:
+                try:
+                    self.mindfaceInit()
+                except Exception:
+                    self.mindface_failed = True
+                    return []
+            if self.mindface is None:
+                return []
+            try:
+                return self.mindfaceFaceDetect(frame)
+            except Exception:
+                self.mindface_failed = True
+                return []
+
+        return []
+
+    def locate_face_for_capture(self, frame):
+        face = self.select_best_face([self.current_face], frame.shape)
+        if face is not None:
+            return face
+
+        methods = []
+        if self.config.get_config('face_detect'):
+            current_method = self.config.get_config('detect_method')
+            detect_methods = self.config.detect_methods_mapper
+            if current_method == detect_methods['classic']:
+                methods.append('classic')
+            elif current_method == detect_methods['mediapipe']:
+                methods.append('mediapipe')
+            elif current_method == detect_methods['mindspore']:
+                methods.append('mindspore')
+
+        for fallback_method in ('mediapipe', 'classic', 'mindspore'):
+            if fallback_method not in methods:
+                methods.append(fallback_method)
+
+        for method_name in methods:
+            face = self.select_best_face(self.detect_faces_by_method(frame, method_name), frame.shape)
+            if face is not None:
+                return face
+
+        return None
+
     def register_face_inner(self, name):
-        self.registerQueue.put((self.vision_tools.cut_face(self.current_frame, self.current_face), name))
+        if self.current_frame is None:
+            self.registerResultSignal.emit('注册失败：当前没有可用画面')
+            return
+
+        target_face = self.locate_face_for_capture(self.current_frame)
+        if target_face is None:
+            self.registerResultSignal.emit('注册失败：当前没有锁定到人脸，请正对镜头或先开启轻量检测')
+            return
+
+        face_image = self.vision_tools.cut_face(self.current_frame, target_face)
+        if face_image is None or face_image.size == 0:
+            self.registerResultSignal.emit('注册失败：人脸裁剪失败，请调整位置后重试')
+            return
+
+        self.current_face = target_face
+        self.registerQueue.put((face_image, name))
 
     def mindfaceInit(self):
+        if not MINDSPORE_AVAILABLE:
+            self.mindface = None
+            self.detect_config = {}
+            return
         detect_config = 'utils/mindface/detection/configs/RetinaFace_mobilenet025.yaml'
         self.detect_config = read_yaml(detect_config)
         self.detect_config['val_model'] = 'utils/mindface/detection/pretrained/RetinaFace_MobileNet025.ckpt'
@@ -174,33 +479,180 @@ class ClassicFaceRecognizer:
     """
     传统面部识别能力
     """
+    DEFAULT_UNKNOWN_THRESHOLD = 95
 
     def __init__(self, method='lbph'):
         self.method = method
         self.vision = VisionTools()
         self.method = method
-        self.trained = True
+        self.trained = False
+        self.training = False
         self.predicting = False
+        self.label_name_map = {}
+        self.training_data_path = os.path.join('dataset', 'full')
+        self.training_logger = None
+        self.unknown_threshold = self.DEFAULT_UNKNOWN_THRESHOLD
+        self.model_path = os.path.join('pretrained', f'classic_{self.method}.yml')
+        self.model_meta_path = os.path.join('pretrained', f'classic_{self.method}.json')
+        self.face_recognizer = self.create_face_recognizer()
+        self.load_model()
+
+    def create_face_recognizer(self):
         if self.method == 'lbph':
-            # 创建我们的LBPH人脸识别器
-            self.face_recognizer = cv2.face.LBPHFaceRecognizer.create()
-        elif self.method == 'elgenface':
-            # 创建我们的EigenFace人脸识别器
-            self.face_recognizer = cv2.face.EigenFaceRecognizer.create()
-        elif self.method == 'fisherface':
-            # 或者使用FisherFaceRecognizer替换上面的行
-            self.face_recognizer = cv2.face.FisherFaceRecognizer.create()
+            return cv2.face.LBPHFaceRecognizer.create()
+        if self.method == 'elgenface':
+            return cv2.face.EigenFaceRecognizer.create()
+        if self.method == 'fisherface':
+            return cv2.face.FisherFaceRecognizer.create()
+        raise ValueError(f'unsupported recognizer method: {self.method}')
+
+    def delete_saved_model_files(self):
+        for model_file in (self.model_path, self.model_meta_path):
+            try:
+                if os.path.exists(model_file):
+                    os.remove(model_file)
+            except OSError:
+                continue
+
+    def invalidate_model(self, remove_persisted=False):
+        self.trained = False
+        self.predicting = False
+        self.label_name_map = {}
+        self.face_recognizer = self.create_face_recognizer()
+        if remove_persisted:
+            self.delete_saved_model_files()
+
+    def dataset_signature(self):
+        if not os.path.isdir(self.training_data_path):
+            return None
+
+        signature_items = []
+        for root, dirs, files in os.walk(self.training_data_path):
+            dirs[:] = sorted(dir_name for dir_name in dirs if not dir_name.startswith('.'))
+            visible_files = sorted(file_name for file_name in files if not file_name.startswith('.'))
+            for file_name in visible_files:
+                file_path = os.path.join(root, file_name)
+                try:
+                    file_stat = os.stat(file_path)
+                except OSError:
+                    continue
+                relative_path = os.path.relpath(file_path, self.training_data_path)
+                modified_ns = getattr(file_stat, 'st_mtime_ns', int(file_stat.st_mtime * 1_000_000_000))
+                signature_items.append(f'{relative_path}:{file_stat.st_size}:{modified_ns}')
+
+        if not signature_items:
+            return None
+
+        return hashlib.sha256('\n'.join(signature_items).encode('utf-8')).hexdigest()
+
+    def save_model(self):
+        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+        self.face_recognizer.write(self.model_path)
+        metadata = {
+            'method': self.method,
+            'unknown_threshold': self.unknown_threshold,
+            'label_name_map': {str(key): value for key, value in self.label_name_map.items()},
+            'dataset_signature': self.dataset_signature(),
+        }
+        with open(self.model_meta_path, 'w', encoding='utf-8') as meta_file:
+            json.dump(metadata, meta_file, ensure_ascii=False, indent=2)
+
+    def load_model(self):
+        if not os.path.exists(self.model_path) or not os.path.exists(self.model_meta_path):
+            self.invalidate_model(remove_persisted=False)
+            return False
+
+        try:
+            with open(self.model_meta_path, 'r', encoding='utf-8') as meta_file:
+                metadata = json.load(meta_file)
+        except (OSError, json.JSONDecodeError):
+            self.invalidate_model(remove_persisted=True)
+            return False
+
+        if metadata.get('method') != self.method:
+            self.invalidate_model(remove_persisted=True)
+            return False
+
+        current_signature = self.dataset_signature()
+        saved_signature = metadata.get('dataset_signature')
+        if current_signature != saved_signature:
+            self.invalidate_model(remove_persisted=True)
+            return False
+
+        try:
+            self.face_recognizer = self.create_face_recognizer()
+            self.face_recognizer.read(self.model_path)
+        except cv2.error:
+            self.invalidate_model(remove_persisted=True)
+            return False
+
+        self.label_name_map = {
+            int(key): value for key, value in metadata.get('label_name_map', {}).items()
+        }
+        self.unknown_threshold = self.DEFAULT_UNKNOWN_THRESHOLD
+        self.trained = bool(self.label_name_map)
+        if not self.trained:
+            self.invalidate_model(remove_persisted=True)
+            return False
+        return True
 
     def train(self, putLog):
-        self.training_thread = ClassicTrainingDataThread(self.vision, "dataset/B210413/full", self.method)
+        if self.training:
+            putLog("经典模型正在训练中，请稍候")
+            return False
+
+        if not os.path.isdir(self.training_data_path):
+            putLog("训练失败：未找到本地样本目录 dataset/full")
+            self.invalidate_model(remove_persisted=True)
+            return False
+
+        sample_dirs = [
+            dir_name for dir_name in os.listdir(self.training_data_path)
+            if os.path.isdir(os.path.join(self.training_data_path, dir_name)) and not dir_name.startswith(".")
+        ]
+        if not sample_dirs:
+            putLog("训练失败：dataset/full 中还没有可用样本")
+            self.invalidate_model(remove_persisted=True)
+            return False
+
+        self.training = True
+        self.invalidate_model(remove_persisted=True)
+        self.training_logger = putLog
+        self.training_thread = ClassicTrainingDataThread(self.vision, self.training_data_path, self.method)
         self.training_thread.log_signal.connect(putLog)
         self.training_thread.finish_signal.connect(self.finish_training)
         self.training_thread.start()
+        putLog("开始训练经典模型")
+        return True
 
     def finish_training(self):
-        # 训练我们的面部识别器
-        self.face_recognizer.train(self.training_thread.faces, self.training_thread.labels)
+        self.training = False
+
+        if not self.training_thread.faces or len(self.training_thread.labels) == 0:
+            self.invalidate_model(remove_persisted=True)
+            if self.training_logger:
+                self.training_logger("训练失败：没有检测到可用于训练的人脸样本")
+            return
+
+        try:
+            self.face_recognizer.train(self.training_thread.faces, self.training_thread.labels)
+        except cv2.error as exc:
+            self.invalidate_model(remove_persisted=True)
+            if self.training_logger:
+                self.training_logger(f"训练失败：{exc}")
+            return
+
+        self.label_name_map = dict(self.training_thread.label_name_map)
         self.trained = True
+        try:
+            self.save_model()
+        except (cv2.error, OSError, TypeError, ValueError) as exc:
+            self.invalidate_model(remove_persisted=True)
+            if self.training_logger:
+                self.training_logger(f"训练失败：无法保存经典模型 ({exc})")
+            return
+        if self.training_logger:
+            self.training_logger(f"训练完成：已载入 {len(self.label_name_map)} 个身份样本，并已保存本地模型")
 
     def detect_face(self, frame):
         """
@@ -216,7 +668,9 @@ class ClassicFaceRecognizer:
         :param input_img: 输入的预测图像
         :return: 预测完成的图像、对应的id和概率
         """
-        # 制作图像的副本，因为我们不想更改原始图像
+        if not self.trained:
+            raise RuntimeError("经典模型尚未训练")
+
         label_text = (None, None)
         # for face in faces:
         #     face = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
@@ -228,11 +682,13 @@ class ClassicFaceRecognizer:
         #     # draw_text(img, f'B{label_text[0]} possibility: {label_text[1]}', face[0], face[1] - 5)
         # 使用我们的脸部识别器预测图像
         label = self.face_recognizer.predict(cv2.cvtColor(cv2.resize(faces, (160, 160)), cv2.COLOR_BGR2GRAY))
-        # 获取由人脸识别器返回的相应标签的名称
         label_text = label
-        # 画预计人的名字
-        # draw_text(img, f'B{label_text[0]} possibility: {label_text[1]}', face[0], face[1] - 5)
-        return None, label_text[0], label_text[1]
+        label_id = int(label_text[0])
+        label_name = self.label_name_map.get(label_id)
+        confidence = float(label_text[1])
+        if label_name is None or confidence > self.unknown_threshold:
+            return None, '未知', confidence
+        return None, label_name, label_text[1]
 
 
 class ClassicTrainingDataThread(QThread):
@@ -249,19 +705,26 @@ class ClassicTrainingDataThread(QThread):
         self.method = method
         self.faces = []
         self.labels = []
+        self.label_name_map = {}
 
     def run(self):
-        self.log_signal.emit("Preparing data...")
-        faces, labels = self.vision_tools.prepare_training_data(self.data_folder_path, self.log_signal.emit,
-                                                                self.method)
+        self.log_signal.emit("正在准备训练数据...")
+        faces, labels, label_name_map = self.vision_tools.prepare_training_data(
+            self.data_folder_path,
+            self.log_signal.emit,
+            self.method,
+        )
         self.faces = faces
         self.labels = labels
-        self.log_signal.emit("Data prepared")
+        self.label_name_map = label_name_map
+        self.log_signal.emit("训练数据准备完成")
         self.finish_signal.emit()
 
 
 class MindFaceService:
     def __init__(self, detectCfg):
+        if not MINDSPORE_AVAILABLE:
+            raise RuntimeError('MindSpore is not available in the current environment.')
         self.detect_options = {}
         self.recog_options = {}
         self.face_detect_prepare(detectCfg)
@@ -407,28 +870,36 @@ class RecogThread(QThread):
         while True:
             if not self.recogQueue.empty():
                 faces = self.recogQueue.get()
-                if self.config.get_config('recog_method') == self.config.recog_methods_mapper['classic']:
-                    label, possibility = classicFaceRecognize(faces, self.classicFaceRecognizer)
-                    print(f"possibility: {possibility} name: {label}")
-                    self.resultSignal.emit(f"B{label}")
-                if self.config.get_config('recog_method') == self.config.recog_methods_mapper['mindspore']:
-                    # 发请求到mindfaceServer
-                    cv2.imwrite('temp/recog.jpg', faces)
-                    url = "http://114.116.250.18:8000/recognize"
-                    m = MultipartEncoder(
-                        fields={'photo': ('recog.jpg', open('temp/recog.jpg', 'rb'), 'image/jpeg')}
-                    )
-                    headers = {
-                        'Content-Type': m.content_type,
-                    }
-                    response = requests.request("POST", headers=headers, url=url, data=m)
-                    sleep(3)
-                    print(response)
-                    if response.status_code == 200:
-                        self.resultSignal.emit(response.json()['name'])
-                    else:
-                        # self.resultSignal.emit("未知")
-                        pass
+                try:
+                    if self.config.get_config('recog_method') == self.config.recog_methods_mapper['classic']:
+                        if not self.classicFaceRecognizer.trained:
+                            continue
+                        label, possibility = classicFaceRecognize(faces, self.classicFaceRecognizer)
+                        print(f"possibility: {possibility} name: {label}")
+                        if label:
+                            self.resultSignal.emit(str(label))
+                    if self.config.get_config('recog_method') == self.config.recog_methods_mapper['mindspore']:
+                        # 发请求到远端 embedding 服务
+                        os.makedirs('temp', exist_ok=True)
+                        cv2.imwrite('temp/recog.jpg', faces)
+                        url = f"{FACE_SERVICE_BASE_URL}/recognize"
+                        m = MultipartEncoder(
+                            fields={'photo': ('recog.jpg', open('temp/recog.jpg', 'rb'), 'image/jpeg')}
+                        )
+                        headers = {
+                            'Content-Type': m.content_type,
+                        }
+                        response = requests.request("POST", headers=headers, url=url, data=m, timeout=8)
+                        print(response)
+                        if response.status_code == 200:
+                            payload = response.json()
+                            self.resultSignal.emit(payload.get('name', '未知'))
+                except (RuntimeError, cv2.error, requests.RequestException) as exc:
+                    print(f"recognition error: {exc}")
+                    continue
+                except Exception as exc:
+                    print(f"unexpected recognition error: {exc}")
+                    continue
 
 class RegisterThread(QThread):
     def __init__(self, registerResultSignal):
@@ -441,26 +912,52 @@ class RegisterThread(QThread):
         while True:
             if not self.registerQueue.empty():
                 faces, name = self.registerQueue.get()
-                cv2.imwrite('temp/register.jpg', faces)
-                url = "http://114.116.250.18:8000/register"
-                m = MultipartEncoder(
-                    fields={'name': name, 'photo': ('register.jpg',
-                                                    open('temp/register.jpg',
-                                                         'rb'), 'image/jpeg')}
-                )
-                headers = {
-                    'Content-Type': m.content_type,
-                }
-                response = requests.request("POST", headers=headers, url=url, data=m)
-                print(response)
-                if response.status_code == 200:
-                    self.registerResultSignal.emit("注册成功")
-                    os.path.exists('temp/register.jpg') and os.remove('temp/register.jpg')
-                    # 检查dataset/full下是否有该人的文件夹，没有则创建
-                    if not os.path.exists(f'dataset/full/{name}'):
-                        os.makedirs(f'dataset/full/{name}')
-                    # 将照片保存到dataset/full下
-                    cv2.imwrite(f'dataset/full/{name}/{name}.jpg', faces)
-                else:
-                    self.registerResultSignal.emit("注册失败")
-                    os.path.exists('temp/register.jpg') and os.remove('temp/register.jpg')
+                temp_dir = 'temp'
+                temp_path = os.path.join(temp_dir, 'register.jpg')
+                local_dir = os.path.join('dataset', 'full', name)
+                local_path = os.path.join(local_dir, f'{name}.jpg')
+
+                try:
+                    os.makedirs(temp_dir, exist_ok=True)
+                    os.makedirs(local_dir, exist_ok=True)
+
+                    if not cv2.imwrite(local_path, faces):
+                        self.registerResultSignal.emit("注册失败：无法写入本地样本")
+                        continue
+
+                    if not cv2.imwrite(temp_path, faces):
+                        self.registerResultSignal.emit("注册失败：无法写入临时文件")
+                        continue
+
+                    url = f"{FACE_SERVICE_BASE_URL}/register"
+                    with open(temp_path, 'rb') as photo_file:
+                        m = MultipartEncoder(
+                            fields={
+                                'name': name,
+                                'photo': ('register.jpg', photo_file, 'image/jpeg'),
+                            }
+                        )
+                        headers = {
+                            'Content-Type': m.content_type,
+                        }
+                        response = requests.request(
+                            "POST",
+                            headers=headers,
+                            url=url,
+                            data=m,
+                            timeout=8,
+                        )
+
+                    print(response)
+                    if response.status_code == 200:
+                        self.registerResultSignal.emit("注册成功：已保存本地样本并同步到服务")
+                    else:
+                        self.registerResultSignal.emit(
+                            f"本地采集成功：远端服务返回 {response.status_code}"
+                        )
+                except requests.RequestException:
+                    self.registerResultSignal.emit("本地采集成功：远端注册服务不可用")
+                except OSError:
+                    self.registerResultSignal.emit("注册失败：读写注册文件时出错")
+                finally:
+                    os.path.exists(temp_path) and os.remove(temp_path)

@@ -1,13 +1,11 @@
-from PyQt5.QtCore import pyqtSignal
-
 from utils.common import singleton
-import multiprocessing
+from queue import Queue
 
 
 @singleton
 class ConfigStore:
-    recogQueue = multiprocessing.Queue()  # 识别队列
-    registerQueue = multiprocessing.Queue()  # 注册队列
+    recogQueue = Queue(maxsize=1)  # 识别队列
+    registerQueue = Queue()  # 注册队列
 
     def __init__(self):
         self.config = {

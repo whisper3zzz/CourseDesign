@@ -1,0 +1,24 @@
+[project]
+name = "course-design-face-recognition"
+version = "0.1.0"
+description = "PyQt5 face recognition course design project based on OpenCV, MediaPipe, and optional MindSpore components."
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "mediapipe>=0.10.14",
+    "numpy>=1.26,<2",
+    "opencv-contrib-python>=4.10",
+    "pillow>=10.0",
+    "PyQt5>=5.15.10",
+    "requests>=2.32",
+    "requests-toolbelt>=1.0.0",
+]
+
+[project.optional-dependencies]
+mindspore = [
+    "mindspore",
+    "pyyaml",
+]
+
+[tool.uv]
+package = false
