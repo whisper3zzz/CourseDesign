@@ -21,7 +21,11 @@ die() {
 mkdir -p "${MODEL_DIR}"
 [ -f "${ONNX_PATH}" ] || die "missing ONNX model: ${ONNX_PATH}"
 
-export LD_LIBRARY_PATH="${LITE_ROOT}/tools/converter/lib:${LITE_ROOT}/runtime/lib:${LD_LIBRARY_PATH:-}"
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+  export LD_LIBRARY_PATH="${LITE_ROOT}/tools/converter/lib:${LITE_ROOT}/runtime/lib:${LD_LIBRARY_PATH}"
+else
+  export LD_LIBRARY_PATH="${LITE_ROOT}/tools/converter/lib:${LITE_ROOT}/runtime/lib"
+fi
 
 "${CONVERTER_BIN}" \
   --fmk=ONNX \
