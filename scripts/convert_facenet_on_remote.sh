@@ -10,11 +10,16 @@ MINDIR_PATH="${MODEL_DIR}/facenet_vggface2.mindir"
 CONVERTER_BIN="${LITE_ROOT}/tools/converter/converter/converter_lite"
 BENCHMARK_BIN="${LITE_ROOT}/tools/benchmark/benchmark"
 
-test -d "${LITE_ROOT}"
-test -x "${CONVERTER_BIN}"
-test -x "${BENCHMARK_BIN}"
-test -f "${ONNX_PATH}"
+die() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+[ -d "${LITE_ROOT}" ] || die "missing LITE_ROOT: ${LITE_ROOT}"
+[ -x "${CONVERTER_BIN}" ] || die "missing converter binary: ${CONVERTER_BIN}"
+[ -x "${BENCHMARK_BIN}" ] || die "missing benchmark binary: ${BENCHMARK_BIN}"
 mkdir -p "${MODEL_DIR}"
+[ -f "${ONNX_PATH}" ] || die "missing ONNX model: ${ONNX_PATH}"
 
 export LD_LIBRARY_PATH="${LITE_ROOT}/tools/converter/lib:${LITE_ROOT}/runtime/lib:${LD_LIBRARY_PATH:-}"
 
@@ -24,6 +29,7 @@ export LD_LIBRARY_PATH="${LITE_ROOT}/tools/converter/lib:${LITE_ROOT}/runtime/li
   --outputFile="${MODEL_DIR}/facenet_vggface2" \
   --saveType=MINDIR
 
+[ -f "${MINDIR_PATH}" ] || die "conversion did not produce: ${MINDIR_PATH}"
 "${BENCHMARK_BIN}" \
   --modelFile="${MINDIR_PATH}" \
   --modelType=MindIR \
