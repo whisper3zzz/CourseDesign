@@ -63,12 +63,31 @@ def build_demo_dataset(source_root: Path, output_root: Path, val_ratio: float = 
             continue
 
         class_names.append(identity.name)
-        val_count = int(len(images) * val_ratio)
-        val_images = images[:val_count]
-        train_images = images[val_count:]
+        total_images = len(images)
+        train_images: Sequence[Path]
+        val_images: Sequence[Path]
 
-        _copy_to_directory(val_images, val_root / identity.name)
-        _copy_to_directory(train_images, train_root / identity.name)
+        if total_images == 1:
+            val_images = []
+            train_images = images
+        else:
+            if val_ratio > 0:
+                val_count = max(1, int(total_images * val_ratio))
+                val_count = min(val_count, total_images - 1)
+            else:
+                val_count = 0
+
+            if val_count:
+                train_images = images[:-val_count]
+                val_images = images[-val_count:]
+            else:
+                train_images = images
+                val_images = []
+
+        if val_images:
+            _copy_to_directory(val_images, val_root / identity.name)
+        if train_images:
+            _copy_to_directory(train_images, train_root / identity.name)
 
     return DemoDatasetResult(class_names=class_names)
 
