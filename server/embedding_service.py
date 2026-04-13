@@ -563,10 +563,10 @@ def create_app(
     @app.post("/train_classifier")
     def train_classifier_endpoint() -> dict:
         classifier_root = runtime_root / "classifier"
-        source_root = Path("dataset/full").resolve()
+        source_root = runtime_root / "faces"
         if not classifier_dataset_ready(source_root):
             raise HTTPException(
-                status_code=400, detail="dataset/full is missing or empty"
+                status_code=400, detail="faces is missing or empty"
             )
         try:
             dataset_result = build_classifier_dataset(

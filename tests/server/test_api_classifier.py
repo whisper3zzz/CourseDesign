@@ -114,13 +114,13 @@ def test_health_reports_classifier_fields(tmp_path: Path) -> None:
 
 def test_train_classifier_success(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    dataset_root = tmp_path / "dataset" / "full" / "Alice"
-    dataset_root.mkdir(parents=True, exist_ok=True)
-    (dataset_root / "face.jpg").write_bytes(b"fake")
+    faces_root = tmp_path / "faces" / "Alice"
+    faces_root.mkdir(parents=True, exist_ok=True)
+    (faces_root / "face.jpg").write_bytes(b"fake")
     assets = ClassifierArtifactPaths(tmp_path / "classifier")
     classifier_root = assets.root
     prepared_root = classifier_root / "dataset"
-    expected_source = (tmp_path / "dataset" / "full").resolve()
+    expected_source = (tmp_path / "faces").resolve()
     calls: dict[str, tuple] = {}
 
     def fake_build_classifier_dataset(
@@ -220,7 +220,7 @@ def test_train_classifier_missing_dataset(tmp_path: Path, monkeypatch) -> None:
 
     assert response.status_code == 400
     payload = response.json()
-    assert "dataset/full" in payload["detail"]
+    assert "faces" in payload["detail"]
 
 
 def test_recognize_routes_to_classifier_backend(tmp_path: Path) -> None:
