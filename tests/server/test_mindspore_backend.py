@@ -44,6 +44,8 @@ def test_recognize_returns_unknown_when_score_is_below_threshold(tmp_path: Path,
 
     assert payload["name"] == "未知"
     assert payload["matched"] is False
+    assert payload["candidate_name"] == "alice"
+    assert payload["candidate_score"] == 0.0
     assert payload["backend"] == "mindspore_embedding"
 
 
@@ -64,4 +66,6 @@ def test_recognize_returns_name_when_score_meets_threshold(tmp_path: Path, monke
 
     assert payload["name"] == "alice"
     assert payload["matched"] is True
+    assert payload["candidate_name"] == "alice"
+    assert payload["candidate_score"] == 1.0
     assert payload["backend"] == "mindspore_embedding"

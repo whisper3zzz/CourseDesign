@@ -92,6 +92,8 @@ class MindSporeEmbeddingBackend:
             "name": best_name if matched else "未知",
             "matched": matched,
             "score": round(best_score, 4),
+            "candidate_name": best_name if best_score >= 0 else "未知",
+            "candidate_score": round(best_score, 4) if best_score >= 0 else 0.0,
             "backend": "mindspore_embedding",
             "ready": True,
         }

@@ -19,6 +19,8 @@ import multiprocessing
 import requests
 from time import sleep
 
+from service.recognition_result import select_display_name
+
 FACE_SERVICE_BASE_URL = os.getenv('FACE_SERVICE_BASE_URL', 'http://127.0.0.1:18000').rstrip('/')
 
 try:
@@ -117,8 +119,7 @@ class VisionService(QThread):
 
 
 def classicFaceRecognize(faces, classicPredictor):
-    res = classicPredictor.predict(faces)
-    return res[1], res[2]
+    return classicPredictor.predict(faces)
 
 
 def encode_face_image(image):
@@ -700,9 +701,14 @@ class ClassicFaceRecognizer:
         label_id = int(label_text[0])
         label_name = self.label_name_map.get(label_id)
         confidence = float(label_text[1])
-        if label_name is None or confidence > self.unknown_threshold:
-            return None, '未知', confidence
-        return None, label_name, label_text[1]
+        matched = label_name is not None and confidence <= self.unknown_threshold
+        return {
+            'name': label_name if matched else '未知',
+            'matched': matched,
+            'score': confidence,
+            'candidate_name': label_name if label_name is not None else '未知',
+            'candidate_score': confidence,
+        }
 
 
 class ClassicTrainingDataThread(QThread):
@@ -891,10 +897,15 @@ class RecogThread(QThread):
                 if self.config.get_config('recog_method') == self.config.recog_methods_mapper['classic']:
                     if not self.classicFaceRecognizer.trained:
                         continue
-                    label, possibility = classicFaceRecognize(faces, self.classicFaceRecognizer)
-                    print(f"possibility: {possibility} name: {label}")
-                    if label:
-                        self.resultSignal.emit(str(label))
+                    payload = classicFaceRecognize(faces, self.classicFaceRecognizer)
+                    display_name = select_display_name(payload)
+                    print(
+                        f"score: {payload.get('score')} "
+                        f"name: {payload.get('name')} "
+                        f"candidate: {payload.get('candidate_name')}"
+                    )
+                    if display_name:
+                        self.resultSignal.emit(str(display_name))
                 if self.config.get_config('recog_method') == self.config.recog_methods_mapper['mindspore']:
                     photo_bytes = encode_face_image(faces)
                     url = f"{FACE_SERVICE_BASE_URL}/recognize"
@@ -906,7 +917,7 @@ class RecogThread(QThread):
                     print(response)
                     if response.status_code == 200:
                         payload = response.json()
-                        self.resultSignal.emit(payload.get('name', '未知'))
+                        self.resultSignal.emit(select_display_name(payload))
             except (RuntimeError, ValueError, cv2.error, requests.RequestException) as exc:
                 print(f"recognition error: {exc}")
                 continue
