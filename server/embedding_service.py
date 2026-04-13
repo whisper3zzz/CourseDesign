@@ -16,6 +16,8 @@ from facenet_pytorch import InceptionResnetV1
 from PIL import Image
 from torchvision import transforms
 
+from server.classifier_assets import ClassifierArtifactPaths
+from server.classifier_backend import ClassifierBackend
 from server.mindspore_backend import MindSporeEmbeddingBackend, MindSporeModelNotReady
 from server.model_assets import ModelArtifactPaths
 
@@ -307,6 +309,7 @@ def create_app(
     runtime_root: Path | None = None,
     service: FaceEmbeddingService | None = None,
     mindspore_backend: MindSporeEmbeddingBackend | None = None,
+    classifier_backend: ClassifierBackend | None = None,
 ) -> FastAPI:
     if runtime_root is None:
         candidate_root = getattr(service, "runtime_root", None)
@@ -320,12 +323,15 @@ def create_app(
         runtime_root = Path(runtime_root).resolve()
 
     assets = ModelArtifactPaths(runtime_root / "models")
+    classifier_assets = ClassifierArtifactPaths(runtime_root / "classifier")
     app = FastAPI(title="Course Design Face Embedding Service")
 
     app.state.runtime_root = runtime_root
     app.state.service = service
     app.state.mindspore_backend = mindspore_backend
     app.state.mindspore_assets = assets
+    app.state.classifier_backend = classifier_backend
+    app.state.classifier_assets = classifier_assets
 
     def get_service() -> FaceEmbeddingService:
         if app.state.service is None:
@@ -345,11 +351,43 @@ def create_app(
         return app.state.mindspore_backend
 
 
+    def get_classifier_backend() -> ClassifierBackend:
+        if app.state.classifier_backend is None:
+            if app.state.service is not None:
+                threshold = app.state.service.threshold
+            else:
+                threshold = float(os.getenv("FACE_SERVICE_THRESHOLD", "0.72"))
+            app.state.classifier_backend = ClassifierBackend(
+                model_path=classifier_assets.mindir_path,
+                label_map_path=classifier_assets.label_map_path,
+                threshold=threshold,
+            )
+        return app.state.classifier_backend
+
+
+    def classifier_is_ready(backend: ClassifierBackend | None) -> bool:
+        if backend is None:
+            return False
+        backend_ready = getattr(backend, "is_ready", None)
+        if callable(backend_ready):
+            try:
+                return bool(backend_ready())
+            except Exception:
+                return False
+        model_path = Path(getattr(backend, "model_path", classifier_assets.mindir_path))
+        label_map_path = Path(
+            getattr(backend, "label_map_path", classifier_assets.label_map_path)
+        )
+        return model_path.exists() and label_map_path.exists()
+
+
     @app.get("/health")
     def health() -> dict:
         service = get_service()
         backend = get_mindspore_backend()
         ready = backend.is_ready()
+        classifier_backend = get_classifier_backend()
+        classifier_ready = classifier_is_ready(classifier_backend)
         return {
             "status": "ok",
             "active_backend": "mindspore_embedding"
@@ -357,6 +395,10 @@ def create_app(
             else "pytorch_embedding",
             "mindspore_model_ready": ready,
             "mindspore_model_path": str(backend.model_path),
+            "classifier_model_ready": classifier_ready,
+            "classifier_model_path": str(classifier_assets.mindir_path),
+            "classifier_label_map_path": str(classifier_assets.label_map_path),
+            "classifier_backend_available": classifier_backend is not None,
             "device": service.device,
             "model": service.model_name,
             "threshold": service.threshold,
@@ -435,6 +477,24 @@ def create_app(
         payload["backend"] = payload.get("backend", "mindspore_embedding")
         payload["ready"] = True
         return payload
+
+
+    @app.post("/train_classifier")
+    def train_classifier() -> dict:
+        classifier_backend = get_classifier_backend()
+        classifier_ready = classifier_is_ready(classifier_backend)
+        model_path = classifier_assets.mindir_path
+        label_map_path = classifier_assets.label_map_path
+        return {
+            "status": "not_ready",
+            "backend": "cnn_classifier",
+            "classifier_model_ready": classifier_ready,
+            "classifier_model_path": str(model_path),
+            "classifier_label_map_path": str(label_map_path),
+            "classifier_model_exists": model_path.exists(),
+            "classifier_label_map_exists": label_map_path.exists(),
+            "detail": "classifier training pipeline is not wired yet",
+        }
 
     return app
 
