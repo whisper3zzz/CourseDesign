@@ -68,8 +68,18 @@ server/
 
 - `FastAPI`
 - `uvicorn`
+- `mindspore_lite`
 - `PyTorch`
 - `facenet-pytorch`
+
+## 模型与后端
+
+服务以 `InceptionResnetV1(vggface2)` 作为主要的模型转换目标：
+
+- 优先使用 `mindspore_lite` 转换后的推理模型进行识别
+- 若转换模型不可用，则回退到现有的 PyTorch embedding 服务实现
+
+模型转换使用随仓库提供的 `converter_lite`，转换完成后建议用 `benchmark` 进行一致性验证。
 
 这里保留的是服务模块本身，不绑定特定机器、特定端口或特定部署环境。实际部署时，请根据自己的服务器环境单独配置。
 
