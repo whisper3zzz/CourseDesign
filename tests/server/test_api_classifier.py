@@ -5,8 +5,10 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from PIL import Image
 
+import server.embedding_service as embedding_service
 from server.classifier_assets import ClassifierArtifactPaths
 from server.embedding_service import create_app
+from scripts.prepare_classifier_dataset import ClassifierDatasetResult
 
 
 class DummyStore:
@@ -110,8 +112,55 @@ def test_health_reports_classifier_fields(tmp_path: Path) -> None:
     assert payload["classifier_class_count"] == 2
 
 
-def test_train_classifier_endpoint_exists(tmp_path: Path) -> None:
+def test_train_classifier_success(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    dataset_root = tmp_path / "dataset" / "full" / "Alice"
+    dataset_root.mkdir(parents=True, exist_ok=True)
+    (dataset_root / "face.jpg").write_bytes(b"fake")
     assets = ClassifierArtifactPaths(tmp_path / "classifier")
+    classifier_root = assets.root
+    prepared_root = classifier_root / "dataset"
+    expected_source = (tmp_path / "dataset" / "full").resolve()
+    calls: dict[str, tuple] = {}
+
+    def fake_build_classifier_dataset(
+        source_root: Path, output_root: Path, val_ratio: float
+    ) -> ClassifierDatasetResult:
+        calls["build"] = (source_root, output_root, val_ratio)
+        return ClassifierDatasetResult(
+            class_names=["Alice", "Bob"],
+            train_root=output_root / "train",
+            val_root=output_root / "val",
+        )
+
+    def fake_train_classifier(
+        train_root: Path, val_root: Path, output_dir: Path
+    ) -> tuple[Path, Path]:
+        calls["train"] = (train_root, val_root, output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        weights_path = output_dir / "classifier.pt"
+        label_map_path = output_dir / "label_map.json"
+        weights_path.write_text("stub", encoding="utf-8")
+        label_map_path.write_text(
+            json.dumps({"0": "Alice", "1": "Bob"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return weights_path, label_map_path
+
+    def fake_export_classifier(
+        weights_path: Path, label_map_path: Path, output_path: Path
+    ) -> Path:
+        calls["export"] = (weights_path, label_map_path, output_path)
+        output_path.write_text("onnx", encoding="utf-8")
+        return output_path
+
+    monkeypatch.setattr(
+        embedding_service, "build_classifier_dataset", fake_build_classifier_dataset
+    )
+    monkeypatch.setattr(embedding_service, "train_classifier", fake_train_classifier)
+    monkeypatch.setattr(
+        embedding_service, "export_classifier", fake_export_classifier
+    )
     app = create_app(
         runtime_root=tmp_path,
         service=DummyService(),
@@ -128,11 +177,50 @@ def test_train_classifier_endpoint_exists(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "not_ready"
+    assert payload["status"] == "ok"
     assert payload["backend"] == "cnn_classifier"
+    assert payload["class_count"] == 2
+    assert payload["train_root"] == str(prepared_root / "train")
+    assert payload["val_root"] == str(prepared_root / "val")
+    assert payload["weights_path"] == str(classifier_root / "classifier.pt")
+    assert payload["label_map_path"] == str(classifier_root / "label_map.json")
+    assert payload["onnx_path"] == str(classifier_root / "classifier.onnx")
     assert payload["classifier_model_ready"] is False
     assert payload["classifier_model_path"] == str(assets.mindir_path)
     assert payload["classifier_label_map_path"] == str(assets.label_map_path)
+    assert calls["build"] == (expected_source, prepared_root, 0.2)
+    assert calls["train"] == (
+        prepared_root / "train",
+        prepared_root / "val",
+        classifier_root,
+    )
+    assert calls["export"] == (
+        classifier_root / "classifier.pt",
+        classifier_root / "label_map.json",
+        classifier_root / "classifier.onnx",
+    )
+
+
+def test_train_classifier_missing_dataset(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    assets = ClassifierArtifactPaths(tmp_path / "classifier")
+    app = create_app(
+        runtime_root=tmp_path,
+        service=DummyService(),
+        mindspore_backend=DummyMindSporeBackend(tmp_path / "facenet_vggface2.mindir"),
+        classifier_backend=DummyClassifierBackend(
+            assets.mindir_path,
+            assets.label_map_path,
+            ready=False,
+        ),
+    )
+
+    client = TestClient(app)
+    response = client.post("/train_classifier")
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert "dataset/full" in payload["detail"]
 
 
 def test_recognize_routes_to_classifier_backend(tmp_path: Path) -> None:

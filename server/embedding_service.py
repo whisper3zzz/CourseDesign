@@ -16,6 +16,9 @@ from facenet_pytorch import InceptionResnetV1
 from PIL import Image
 from torchvision import transforms
 
+from scripts.export_classifier_to_onnx import export_classifier
+from scripts.prepare_classifier_dataset import SUPPORTED_SUFFIXES, build_classifier_dataset
+from scripts.train_classifier import train_classifier
 from server.classifier_assets import ClassifierArtifactPaths
 from server.classifier_backend import ClassifierBackend
 from server.mindspore_backend import MindSporeEmbeddingBackend, MindSporeModelNotReady
@@ -395,6 +398,19 @@ def create_app(
         return 0
 
 
+    def classifier_dataset_ready(source_root: Path) -> bool:
+        if not source_root.exists():
+            return False
+        for path in source_root.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.name.startswith("."):
+                continue
+            if path.suffix.lower() in SUPPORTED_SUFFIXES:
+                return True
+        return False
+
+
     @app.get("/health")
     def health() -> dict:
         service = get_service()
@@ -545,20 +561,48 @@ def create_app(
 
 
     @app.post("/train_classifier")
-    def train_classifier() -> dict:
-        classifier_backend = get_classifier_backend()
-        classifier_ready = classifier_is_ready(classifier_backend)
+    def train_classifier_endpoint() -> dict:
+        classifier_root = runtime_root / "classifier"
+        source_root = Path("dataset/full").resolve()
+        if not classifier_dataset_ready(source_root):
+            raise HTTPException(
+                status_code=400, detail="dataset/full is missing or empty"
+            )
+        try:
+            dataset_result = build_classifier_dataset(
+                source_root=source_root,
+                output_root=classifier_root / "dataset",
+                val_ratio=0.2,
+            )
+            weights_path, label_map_path = train_classifier(
+                train_root=dataset_result.train_root,
+                val_root=dataset_result.val_root,
+                output_dir=classifier_root,
+            )
+            onnx_path = export_classifier(
+                weights_path=weights_path,
+                label_map_path=label_map_path,
+                output_path=classifier_root / "classifier.onnx",
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"classifier training failed: {exc}"
+            ) from exc
         model_path = classifier_assets.mindir_path
-        label_map_path = classifier_assets.label_map_path
         return {
-            "status": "not_ready",
+            "status": "ok",
             "backend": "cnn_classifier",
-            "classifier_model_ready": classifier_ready,
+            "class_count": len(dataset_result.class_names),
+            "train_root": str(dataset_result.train_root),
+            "val_root": str(dataset_result.val_root),
+            "weights_path": str(weights_path),
+            "label_map_path": str(label_map_path),
+            "onnx_path": str(onnx_path),
+            "classifier_model_ready": model_path.exists(),
             "classifier_model_path": str(model_path),
             "classifier_label_map_path": str(label_map_path),
-            "classifier_model_exists": model_path.exists(),
-            "classifier_label_map_exists": label_map_path.exists(),
-            "detail": "classifier training pipeline is not wired yet",
         }
 
     return app
