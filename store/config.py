@@ -18,7 +18,8 @@ class ConfigStore:
         }
         self.recog_methods_mapper = {
             'classic': 0,
-            'mindspore': 1
+            'mindspore': 1,
+            'cnn_classifier': 2,
         }
         self.detect_methods_mapper = {
             'classic': 0,

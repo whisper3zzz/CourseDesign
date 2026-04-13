@@ -906,11 +906,21 @@ class RecogThread(QThread):
                     )
                     if display_name:
                         self.resultSignal.emit(str(display_name))
-                if self.config.get_config('recog_method') == self.config.recog_methods_mapper['mindspore']:
+                if self.config.get_config('recog_method') in (
+                    self.config.recog_methods_mapper['mindspore'],
+                    self.config.recog_methods_mapper['cnn_classifier'],
+                ):
                     photo_bytes = encode_face_image(faces)
                     url = f"{FACE_SERVICE_BASE_URL}/recognize"
+                    payload_data = None
+                    if (
+                        self.config.get_config('recog_method')
+                        == self.config.recog_methods_mapper['cnn_classifier']
+                    ):
+                        payload_data = {'backend': 'cnn_classifier'}
                     response = self.http.post(
                         url,
+                        data=payload_data,
                         files={'photo': ('recog.jpg', photo_bytes, 'image/jpeg')},
                         timeout=8,
                     )
