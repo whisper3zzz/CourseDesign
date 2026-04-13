@@ -7,9 +7,9 @@ import numpy as np
 from PIL import Image
 
 try:
-    import mindspore as ms
+    import mindspore_lite as mslite
 except ImportError:
-    ms = None
+    mslite = None
 
 class MindSporeModelNotReady(RuntimeError):
     pass
@@ -19,26 +19,51 @@ class MindSporeEmbeddingBackend:
     def __init__(self, model_path: Path, threshold: float = 0.72) -> None:
         self.model_path = Path(model_path)
         self.threshold = float(threshold)
-        self._graph = None
+        self._model = None
 
-    def _load_graph(self):
-        if ms is None:
-            raise MindSporeModelNotReady("mindspore is unavailable")
+    def _load_model(self):
+        if mslite is None:
+            raise MindSporeModelNotReady("mindspore_lite is unavailable")
         if not self.model_path.exists():
             raise MindSporeModelNotReady(f"missing model: {self.model_path}")
-        if self._graph is None:
-            graph = ms.load(str(self.model_path))
-            self._graph = ms.nn.GraphCell(graph=graph)
-        return self._graph
+        if self._model is None:
+            try:
+                context = mslite.Context()
+                context.target = ["cpu"]
+                model = mslite.Model()
+                model.build_from_file(
+                    str(self.model_path), mslite.ModelType.MINDIR, context
+                )
+                self._model = model
+            except Exception as exc:
+                raise MindSporeModelNotReady(
+                    f"failed to load mindspore_lite model: {exc}"
+                ) from exc
+        return self._model
 
     def embed_bytes(self, image_bytes: bytes) -> np.ndarray:
-        graph = self._load_graph()
+        model = self._load_model()
         image = Image.open(BytesIO(image_bytes)).convert("RGB").resize((160, 160))
         array = np.asarray(image, dtype=np.float32)
         array = ((array / 255.0) - 0.5) / 0.5
         array = np.transpose(array, (2, 0, 1))[None, ...]
-        tensor = ms.Tensor(array, ms.float32)
-        embedding = graph(tensor).asnumpy()[0]
+
+        inputs = model.get_inputs()
+        model.resize(inputs, [[1, 3, 160, 160]])
+        input_tensor = model.get_inputs()[0]
+        input_tensor.set_data_from_numpy(array.astype(np.float32))
+
+        outputs = model.predict([input_tensor])
+        if not outputs:
+            raise MindSporeModelNotReady("mindspore_lite returned no outputs")
+        embedding = outputs[0].get_data_to_numpy()
+        if not isinstance(embedding, np.ndarray):
+            raise MindSporeModelNotReady("mindspore_lite output is not a numpy array")
+        if embedding.shape != (1, 512):
+            raise MindSporeModelNotReady(
+                f"unexpected embedding shape: {embedding.shape}"
+            )
+        embedding = embedding[0]
         norm = np.linalg.norm(embedding)
         if norm > 0:
             embedding = embedding / norm

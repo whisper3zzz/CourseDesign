@@ -14,10 +14,12 @@ def test_embed_bytes_raises_when_mindir_is_missing(tmp_path: Path) -> None:
         backend.embed_bytes(b"fake-image")
 
 
-def test_embed_bytes_raises_when_mindspore_is_unavailable(tmp_path: Path, monkeypatch) -> None:
+def test_embed_bytes_raises_when_mindspore_lite_is_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
     model_path = tmp_path / "facenet_vggface2.mindir"
     model_path.write_bytes(b"mindir")
-    monkeypatch.setattr(backend_module, "ms", None)
+    monkeypatch.setattr(backend_module, "mslite", None)
 
     backend = MindSporeEmbeddingBackend(model_path=model_path)
 
