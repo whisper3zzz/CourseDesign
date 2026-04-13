@@ -16,6 +16,11 @@ from facenet_pytorch import InceptionResnetV1
 from PIL import Image
 from torchvision import transforms
 
+from scripts.export_classifier_to_onnx import export_classifier
+from scripts.prepare_classifier_dataset import SUPPORTED_SUFFIXES, build_classifier_dataset
+from scripts.train_classifier import train_classifier
+from server.classifier_assets import ClassifierArtifactPaths
+from server.classifier_backend import ClassifierBackend
 from server.mindspore_backend import MindSporeEmbeddingBackend, MindSporeModelNotReady
 from server.model_assets import ModelArtifactPaths
 
@@ -307,6 +312,7 @@ def create_app(
     runtime_root: Path | None = None,
     service: FaceEmbeddingService | None = None,
     mindspore_backend: MindSporeEmbeddingBackend | None = None,
+    classifier_backend: ClassifierBackend | None = None,
 ) -> FastAPI:
     if runtime_root is None:
         candidate_root = getattr(service, "runtime_root", None)
@@ -320,12 +326,15 @@ def create_app(
         runtime_root = Path(runtime_root).resolve()
 
     assets = ModelArtifactPaths(runtime_root / "models")
+    classifier_assets = ClassifierArtifactPaths(runtime_root / "classifier")
     app = FastAPI(title="Course Design Face Embedding Service")
 
     app.state.runtime_root = runtime_root
     app.state.service = service
     app.state.mindspore_backend = mindspore_backend
     app.state.mindspore_assets = assets
+    app.state.classifier_backend = classifier_backend
+    app.state.classifier_assets = classifier_assets
 
     def get_service() -> FaceEmbeddingService:
         if app.state.service is None:
@@ -345,11 +354,71 @@ def create_app(
         return app.state.mindspore_backend
 
 
+    def get_classifier_backend() -> ClassifierBackend:
+        if app.state.classifier_backend is None:
+            if app.state.service is not None:
+                threshold = app.state.service.threshold
+            else:
+                threshold = float(os.getenv("FACE_SERVICE_THRESHOLD", "0.72"))
+            app.state.classifier_backend = ClassifierBackend(
+                model_path=classifier_assets.mindir_path,
+                label_map_path=classifier_assets.label_map_path,
+                threshold=threshold,
+            )
+        return app.state.classifier_backend
+
+
+    def classifier_is_ready(backend: ClassifierBackend | None) -> bool:
+        if backend is None:
+            return False
+        backend_ready = getattr(backend, "is_ready", None)
+        if callable(backend_ready):
+            try:
+                return bool(backend_ready())
+            except Exception:
+                return False
+        model_path = Path(getattr(backend, "model_path", classifier_assets.mindir_path))
+        label_map_path = Path(
+            getattr(backend, "label_map_path", classifier_assets.label_map_path)
+        )
+        return model_path.exists() and label_map_path.exists()
+
+
+    def classifier_class_count(label_map_path: Path) -> int:
+        if not label_map_path.exists():
+            return 0
+        try:
+            payload = json.loads(label_map_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        if isinstance(payload, dict):
+            return len(payload)
+        if isinstance(payload, list):
+            return len(payload)
+        return 0
+
+
+    def classifier_dataset_ready(source_root: Path) -> bool:
+        if not source_root.exists():
+            return False
+        for path in source_root.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.name.startswith("."):
+                continue
+            if path.suffix.lower() in SUPPORTED_SUFFIXES:
+                return True
+        return False
+
+
     @app.get("/health")
     def health() -> dict:
         service = get_service()
         backend = get_mindspore_backend()
         ready = backend.is_ready()
+        classifier_backend = get_classifier_backend()
+        classifier_ready = classifier_is_ready(classifier_backend)
+        label_map_path = classifier_assets.label_map_path
         return {
             "status": "ok",
             "active_backend": "mindspore_embedding"
@@ -357,6 +426,12 @@ def create_app(
             else "pytorch_embedding",
             "mindspore_model_ready": ready,
             "mindspore_model_path": str(backend.model_path),
+            "classifier_model_ready": classifier_ready,
+            "classifier_model_path": str(classifier_assets.mindir_path),
+            "classifier_label_map_path": str(label_map_path),
+            "classifier_backend_available": classifier_backend is not None,
+            "classifier_label_map_exists": label_map_path.exists(),
+            "classifier_class_count": classifier_class_count(label_map_path),
             "device": service.device,
             "model": service.model_name,
             "threshold": service.threshold,
@@ -387,13 +462,61 @@ def create_app(
 
 
     @app.post("/recognize")
-    async def recognize(photo: UploadFile = File(...)) -> dict:
+    async def recognize(
+        photo: UploadFile = File(...),
+        backend: str = Form(""),
+    ) -> dict:
         service = get_service()
-        backend = get_mindspore_backend()
         image_bytes = await photo.read()
         if not image_bytes:
             raise HTTPException(status_code=400, detail="empty photo")
         read_image_bytes(image_bytes)
+        backend_name = (backend or "").strip()
+        if backend_name not in {"", "mindspore_embedding", "cnn_classifier"}:
+            raise HTTPException(status_code=400, detail="invalid backend")
+        if backend_name == "cnn_classifier":
+            classifier_backend = get_classifier_backend()
+            classifier_ready = classifier_is_ready(classifier_backend)
+            identity_count = service.store.identity_count()
+            embedding_count = service.store.embedding_count()
+            if not classifier_ready:
+                return {
+                    "name": "未知",
+                    "matched": False,
+                    "score": 0.0,
+                    "candidate_name": "未知",
+                    "candidate_score": 0.0,
+                    "threshold": service.threshold,
+                    "identity_count": identity_count,
+                    "embedding_count": embedding_count,
+                    "backend": "cnn_classifier",
+                    "ready": False,
+                    "detail": "classifier model not ready",
+                }
+            try:
+                payload = classifier_backend.predict_bytes(image_bytes)
+            except Exception:
+                return {
+                    "name": "未知",
+                    "matched": False,
+                    "score": 0.0,
+                    "candidate_name": "未知",
+                    "candidate_score": 0.0,
+                    "threshold": service.threshold,
+                    "identity_count": identity_count,
+                    "embedding_count": embedding_count,
+                    "backend": "cnn_classifier",
+                    "ready": False,
+                    "detail": "classifier prediction failed",
+                }
+            payload["threshold"] = service.threshold
+            payload["identity_count"] = identity_count
+            payload["embedding_count"] = embedding_count
+            payload["backend"] = payload.get("backend", "cnn_classifier")
+            payload["ready"] = True
+            return payload
+
+        backend = get_mindspore_backend()
         centroids = service.store.load_all_centroids()
         identity_count = len(centroids)
         embedding_count = service.store.embedding_count()
@@ -435,6 +558,52 @@ def create_app(
         payload["backend"] = payload.get("backend", "mindspore_embedding")
         payload["ready"] = True
         return payload
+
+
+    @app.post("/train_classifier")
+    def train_classifier_endpoint() -> dict:
+        classifier_root = runtime_root / "classifier"
+        source_root = runtime_root / "faces"
+        if not classifier_dataset_ready(source_root):
+            raise HTTPException(
+                status_code=400, detail="faces is missing or empty"
+            )
+        try:
+            dataset_result = build_classifier_dataset(
+                source_root=source_root,
+                output_root=classifier_root / "dataset",
+                val_ratio=0.2,
+            )
+            weights_path, label_map_path = train_classifier(
+                train_root=dataset_result.train_root,
+                val_root=dataset_result.val_root,
+                output_dir=classifier_root,
+            )
+            onnx_path = export_classifier(
+                weights_path=weights_path,
+                label_map_path=label_map_path,
+                output_path=classifier_root / "classifier.onnx",
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"classifier training failed: {exc}"
+            ) from exc
+        model_path = classifier_assets.mindir_path
+        return {
+            "status": "ok",
+            "backend": "cnn_classifier",
+            "class_count": len(dataset_result.class_names),
+            "train_root": str(dataset_result.train_root),
+            "val_root": str(dataset_result.val_root),
+            "weights_path": str(weights_path),
+            "label_map_path": str(label_map_path),
+            "onnx_path": str(onnx_path),
+            "classifier_model_ready": model_path.exists(),
+            "classifier_model_path": str(model_path),
+            "classifier_label_map_path": str(label_map_path),
+        }
 
     return app
 

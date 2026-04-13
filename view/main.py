@@ -5,6 +5,7 @@ from datetime import datetime
 from queue import Queue
 
 import cv2
+import requests
 from PyQt5.QtCore import QPoint, QPropertyAnimation, QEasingCurve, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPixmap, QTextCursor
 from PyQt5.QtWidgets import (
@@ -84,6 +85,8 @@ class MainPage(QMainWindow, Ui_System):
         self.update_status_labels()
         self.animate_intro()
         QTimer.singleShot(0, self.start_startup_remote_sync)
+
+        self.refresh_recog_button_label()
 
         if self.classicPredictor.trained:
             self.putLog(
@@ -248,6 +251,7 @@ class MainPage(QMainWindow, Ui_System):
         self.previewSubtitleLabel.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.recogMethod.setItemText(0, "经典识别")
         self.recogMethod.setItemText(1, "深度识别")
+        self.recogMethod.setItemText(2, "CNN分类识别")
         self.openDetection.setText("显示锁脸框")
         self.openRecognition.setText("开始自动识别")
         self.detectMethod.setItemText(0, "经典锁脸")
@@ -993,6 +997,8 @@ class MainPage(QMainWindow, Ui_System):
                 self.resultHintLabel.setText("连接摄像头后，可直接开始识别")
             elif not self.openDetection.isChecked():
                 self.resultHintLabel.setText("点击“开始自动识别”后，系统会自动锁定人脸")
+            elif self.recogMethod.currentIndex() == self.config.recog_methods_mapper["cnn_classifier"]:
+                self.resultHintLabel.setText("CNN分类识别需要先训练/更新分类器")
             elif self.recogMethod.currentIndex() == self.config.recog_methods_mapper["classic"] and not classic_ready:
                 if getattr(self.classicPredictor, "training", False):
                     self.resultHintLabel.setText("经典模型训练中，完成后即可开始识别")
@@ -1014,6 +1020,12 @@ class MainPage(QMainWindow, Ui_System):
         self.layout_chrome()
         self.sync_controls_state()
 
+    def refresh_recog_button_label(self):
+        if self.recogMethod.currentIndex() == self.config.recog_methods_mapper["cnn_classifier"]:
+            self.loadMindSporeFace.setText("训练/更新分类器")
+        else:
+            self.loadMindSporeFace.setText("检查远端深度服务")
+
     def sync_controls_state(self):
         camera_active = self.camera_ready
         camera_busy = self.camera_connecting
@@ -1022,21 +1034,27 @@ class MainPage(QMainWindow, Ui_System):
         training_active = getattr(self.classicPredictor, "training", False)
         classic_ready = self.classicPredictor.trained and not getattr(self.classicPredictor, "training", False)
         classic_selected = self.recogMethod.currentIndex() == self.config.recog_methods_mapper["classic"]
+        classifier_selected = self.recogMethod.currentIndex() == self.config.recog_methods_mapper["cnn_classifier"]
         has_name = bool(self.nameInput.text().strip())
         has_samples = self.sample_identity_count > 0
 
         self.switchButton.setDisabled(camera_busy)
-        self.startTrainButton.setDisabled(training_active or not has_samples)
-        if training_active:
-            self.startTrainButton.setText("训练中...")
-        elif classic_ready:
-            self.startTrainButton.setText("重新训练本地样本")
+        if classifier_selected:
+            self.startTrainButton.setDisabled(not has_samples)
+            self.startTrainButton.setText("训练/更新分类器")
         else:
-            self.startTrainButton.setText("用本地样本训练")
-        self.nameInput.setDisabled(camera_busy or training_active)
-        self.imgRegister.setDisabled(not camera_active or camera_busy or training_active)
-        self.deleteSampleButton.setDisabled(training_active or not has_name)
-        self.clearSamplesButton.setDisabled(training_active or not has_samples)
+            self.startTrainButton.setDisabled(training_active or not has_samples)
+            if training_active:
+                self.startTrainButton.setText("训练中...")
+            elif classic_ready:
+                self.startTrainButton.setText("重新训练本地样本")
+            else:
+                self.startTrainButton.setText("用本地样本训练")
+        disable_input = camera_busy or (training_active and not classifier_selected)
+        self.nameInput.setDisabled(disable_input)
+        self.imgRegister.setDisabled(not camera_active or disable_input)
+        self.deleteSampleButton.setDisabled((training_active and not classifier_selected) or not has_name)
+        self.clearSamplesButton.setDisabled((training_active and not classifier_selected) or not has_samples)
         self.openDetection.setDisabled(not camera_active or camera_busy)
         self.detectMethod.setDisabled(not camera_active or camera_busy)
 
@@ -1306,7 +1324,10 @@ class MainPage(QMainWindow, Ui_System):
             and not getattr(self.classicPredictor, "training", False)
         ):
             self.putLog("提示：经典识别需要先采集样本并完成训练")
+        elif self.recogMethod.currentIndex() == self.config.recog_methods_mapper["cnn_classifier"]:
+            self.putLog("提示：CNN分类识别需先训练/更新分类器")
         self.update_status_labels()
+        self.refresh_recog_button_label()
 
     def putLog(self, log):
         self.logQueue.put(log)
@@ -1376,6 +1397,27 @@ class MainPage(QMainWindow, Ui_System):
 
     def start_train(self):
         self.refresh_sample_overview()
+        if self.recogMethod.currentIndex() == self.config.recog_methods_mapper["cnn_classifier"]:
+            if self.sample_identity_count == 0:
+                self.putLog("样本不足，无法训练CNN分类器")
+                return
+            self.putLog("开始训练/更新CNN分类器，请稍候...")
+            service_url = os.getenv("FACE_SERVICE_BASE_URL", "http://127.0.0.1:18000").rstrip("/")
+            try:
+                response = requests.post(
+                    f"{service_url}/train_classifier",
+                    timeout=30,
+                )
+                if response.status_code == 200:
+                    payload = response.json()
+                    message = payload.get("message") or payload.get("status") or "CNN分类器训练完成"
+                    self.putLog(f"{message}")
+                else:
+                    self.putLog(f"CNN分类器训练失败：状态码 {response.status_code}")
+            except requests.RequestException as exc:
+                self.putLog(f"CNN分类器训练请求失败：{exc}")
+            self.update_status_labels()
+            return
         self.classicPredictor.train(self.putLog)
         self.update_status_labels()
 
@@ -1413,6 +1455,9 @@ class MainPage(QMainWindow, Ui_System):
         self.update_status_labels()
 
     def show_mindspore_status(self):
+        if self.recogMethod.currentIndex() == self.config.recog_methods_mapper["cnn_classifier"]:
+            self.start_train()
+            return
         service_url = os.getenv("FACE_SERVICE_BASE_URL", "http://127.0.0.1:18000")
         self.putLog(f"当前深度识别服务地址: {service_url}")
         self.putLog("说明：默认地址通常指向本机转发端口，深度识别由远端服务处理")

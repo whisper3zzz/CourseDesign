@@ -26,6 +26,8 @@
   用于注册单张人脸样本。
 - `POST /recognize`
   用于提交单张人脸图并返回识别结果。
+- `POST /train_classifier`
+  用于触发分类器训练流程（当前仅返回训练准备状态与产物路径）。
 - `GET /health`
   用于查看服务存活状态和运行信息。
 - `GET /identities`
@@ -48,6 +50,7 @@ server/
 - 样本图片
 - 识别用数据文件
 - 统计信息
+- 分类器产物（独立于 embedding 产物）
 
 这些运行期数据不应提交到仓库。
 
@@ -74,7 +77,18 @@ server/
 
 ## 模型与后端
 
-服务以 `InceptionResnetV1(vggface2)` 作为主要的模型转换目标：
+当前远端深度后端包含两条路径：
+
+- `mindspore_embedding`
+  以 `InceptionResnetV1(vggface2)` 的 embedding 推理为主。
+- `cnn_classifier`
+  以分类器模型进行识别推理，需要在 `/recognize` 请求中选择
+  `backend=cnn_classifier`，产物独立存放在 `server/runtime/classifier/`。
+
+分类器推理仅在分类器后端就绪且显式选择 `backend=cnn_classifier` 时生效。
+`/train_classifier` 目前只返回训练准备状态与产物路径，用于提供分类器路径控制面。
+
+其中 embedding 侧的策略是：
 
 - 优先使用 `mindspore_lite` 转换后的推理模型进行识别
 - 若转换模型不可用，则回退到现有的 PyTorch embedding 服务实现
