@@ -16,6 +16,9 @@ from facenet_pytorch import InceptionResnetV1
 from PIL import Image
 from torchvision import transforms
 
+from server.mindspore_backend import MindSporeEmbeddingBackend, MindSporeModelNotReady
+from server.model_assets import ModelArtifactPaths
+
 
 def choose_device() -> str:
     requested = os.getenv("FACE_SERVICE_DEVICE", "").strip().lower()
@@ -24,6 +27,27 @@ def choose_device() -> str:
             return "cpu"
         return requested
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def validate_identity_name(name: str) -> str:
+    clean_name = name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="name is empty")
+    if clean_name in {".", ".."}:
+        raise HTTPException(status_code=400, detail="name cannot be '.' or '..'")
+    if "/" in clean_name or "\\" in clean_name:
+        raise HTTPException(
+            status_code=400, detail="name contains invalid path characters"
+        )
+    return clean_name
+
+
+def read_image_bytes(image_bytes: bytes) -> Image.Image:
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid image: {exc}") from exc
+    return image
 
 
 class EmbeddingStore:
@@ -172,13 +196,18 @@ class EmbeddingStore:
 
 
 class FaceEmbeddingService:
-    def __init__(self) -> None:
+    def __init__(self, runtime_root: Path | None = None) -> None:
         model_name = os.getenv("FACE_SERVICE_MODEL", "vggface2").strip() or "vggface2"
         self.device = choose_device()
         self.threshold = float(os.getenv("FACE_SERVICE_THRESHOLD", "0.72"))
-        self.store = EmbeddingStore(
-            Path(os.getenv("FACE_SERVICE_DATA_DIR", "server/runtime")).resolve()
-        )
+        if runtime_root is None:
+            runtime_root = Path(
+                os.getenv("FACE_SERVICE_DATA_DIR", "server/runtime")
+            ).resolve()
+        else:
+            runtime_root = Path(runtime_root).resolve()
+        self.runtime_root = runtime_root
+        self.store = EmbeddingStore(runtime_root)
         self.transform = transforms.Compose(
             [
                 transforms.Resize((160, 160)),
@@ -191,11 +220,7 @@ class FaceEmbeddingService:
         self.store.write_stats()
 
     def _read_image(self, image_bytes: bytes) -> Image.Image:
-        try:
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"invalid image: {exc}") from exc
-        return image
+        return read_image_bytes(image_bytes)
 
     def embed_bytes(self, image_bytes: bytes) -> np.ndarray:
         image = self._read_image(image_bytes)
@@ -208,11 +233,7 @@ class FaceEmbeddingService:
         return embedding.astype(np.float32)
 
     def register(self, name: str, image_bytes: bytes) -> dict:
-        clean_name = name.strip()
-        if not clean_name:
-            raise HTTPException(status_code=400, detail="name is empty")
-        if "/" in clean_name or "\\" in clean_name:
-            raise HTTPException(status_code=400, detail="name contains invalid path characters")
+        clean_name = validate_identity_name(name)
         self.store.save_face(clean_name, image_bytes)
         embedding = self.embed_bytes(image_bytes)
         sample_count = self.store.append_embedding(clean_name, embedding)
@@ -233,9 +254,7 @@ class FaceEmbeddingService:
         }
 
     def delete_identity(self, name: str) -> dict:
-        clean_name = name.strip()
-        if not clean_name:
-            raise HTTPException(status_code=400, detail="name is empty")
+        clean_name = validate_identity_name(name)
         removed = self.store.delete_identity(clean_name)
         return {
             "name": clean_name,
@@ -280,43 +299,138 @@ class FaceEmbeddingService:
         }
 
 
-service = FaceEmbeddingService()
-app = FastAPI(title="Course Design Face Embedding Service")
+def create_app(
+    runtime_root: Path | None = None,
+    service: FaceEmbeddingService | None = None,
+    mindspore_backend: MindSporeEmbeddingBackend | None = None,
+) -> FastAPI:
+    if runtime_root is None:
+        candidate_root = getattr(service, "runtime_root", None)
+        if candidate_root is None:
+            runtime_root = Path(
+                os.getenv("FACE_SERVICE_DATA_DIR", "server/runtime")
+            ).resolve()
+        else:
+            runtime_root = Path(candidate_root).resolve()
+    else:
+        runtime_root = Path(runtime_root).resolve()
+
+    assets = ModelArtifactPaths(runtime_root / "models")
+    app = FastAPI(title="Course Design Face Embedding Service")
+
+    app.state.runtime_root = runtime_root
+    app.state.service = service
+    app.state.mindspore_backend = mindspore_backend
+    app.state.mindspore_assets = assets
+
+    def get_service() -> FaceEmbeddingService:
+        if app.state.service is None:
+            app.state.service = FaceEmbeddingService(runtime_root=runtime_root)
+        return app.state.service
+
+    def get_mindspore_backend() -> MindSporeEmbeddingBackend:
+        if app.state.mindspore_backend is None:
+            if app.state.service is not None:
+                threshold = app.state.service.threshold
+            else:
+                threshold = float(os.getenv("FACE_SERVICE_THRESHOLD", "0.72"))
+            app.state.mindspore_backend = MindSporeEmbeddingBackend(
+                model_path=assets.mindir_path,
+                threshold=threshold,
+            )
+        return app.state.mindspore_backend
 
 
-@app.get("/health")
-def health() -> dict:
-    return {
-        "status": "ok",
-        "device": service.device,
-        "model": service.model_name,
-        "threshold": service.threshold,
-        "identity_count": service.store.identity_count(),
-        "embedding_count": service.store.embedding_count(),
-    }
+    @app.get("/health")
+    def health() -> dict:
+        service = get_service()
+        backend = get_mindspore_backend()
+        ready = backend.is_ready()
+        return {
+            "status": "ok",
+            "active_backend": "mindspore_embedding"
+            if ready
+            else "pytorch_embedding",
+            "mindspore_model_ready": ready,
+            "mindspore_model_path": str(backend.model_path),
+            "device": service.device,
+            "model": service.model_name,
+            "threshold": service.threshold,
+            "identity_count": service.store.identity_count(),
+            "embedding_count": service.store.embedding_count(),
+        }
 
 
-@app.get("/identities")
-def identities() -> dict:
-    return service.list_identities()
+    @app.get("/identities")
+    def identities() -> dict:
+        service = get_service()
+        return service.list_identities()
 
 
-@app.post("/register")
-async def register(name: str = Form(...), photo: UploadFile = File(...)) -> dict:
-    image_bytes = await photo.read()
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="empty photo")
-    return service.register(name=name, image_bytes=image_bytes)
+    @app.post("/register")
+    async def register(name: str = Form(...), photo: UploadFile = File(...)) -> dict:
+        image_bytes = await photo.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="empty photo")
+        service = get_service()
+        return service.register(name=name, image_bytes=image_bytes)
 
 
-@app.post("/delete_identity")
-async def delete_identity(name: str = Form(...)) -> dict:
-    return service.delete_identity(name=name)
+    @app.post("/delete_identity")
+    async def delete_identity(name: str = Form(...)) -> dict:
+        service = get_service()
+        return service.delete_identity(name=name)
 
 
-@app.post("/recognize")
-async def recognize(photo: UploadFile = File(...)) -> dict:
-    image_bytes = await photo.read()
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="empty photo")
-    return service.recognize(image_bytes=image_bytes)
+    @app.post("/recognize")
+    async def recognize(photo: UploadFile = File(...)) -> dict:
+        service = get_service()
+        backend = get_mindspore_backend()
+        image_bytes = await photo.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="empty photo")
+        read_image_bytes(image_bytes)
+        centroids = service.store.load_all_centroids()
+        identity_count = len(centroids)
+        embedding_count = service.store.embedding_count()
+        ready = backend.is_ready()
+        if not centroids:
+            return {
+                "name": "未知",
+                "matched": False,
+                "score": 0.0,
+                "threshold": service.threshold,
+                "identity_count": identity_count,
+                "embedding_count": embedding_count,
+                "backend": "mindspore_embedding" if ready else "pytorch_embedding",
+                "ready": ready,
+                "detail": "embedding library is empty",
+            }
+
+        if not ready:
+            payload = service.recognize(image_bytes=image_bytes)
+            payload["backend"] = "pytorch_embedding"
+            payload["ready"] = False
+            payload["detail"] = "mindspore model not ready, fallback active"
+            return payload
+
+        try:
+            payload = backend.recognize_bytes(image_bytes, centroids)
+        except MindSporeModelNotReady:
+            payload = service.recognize(image_bytes=image_bytes)
+            payload["backend"] = "pytorch_embedding"
+            payload["ready"] = False
+            payload["detail"] = "mindspore model not ready, fallback active"
+            return payload
+
+        payload["threshold"] = service.threshold
+        payload["identity_count"] = identity_count
+        payload["embedding_count"] = embedding_count
+        payload["backend"] = payload.get("backend", "mindspore_embedding")
+        payload["ready"] = True
+        return payload
+
+    return app
+
+
+app = create_app()
