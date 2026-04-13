@@ -259,6 +259,7 @@ git commit -m "feat: add converted model artifact helpers"
 
 ```python
 # tests/server/test_mindspore_backend.py
+import server.mindspore_backend as backend_module
 from pathlib import Path
 
 import numpy as np
@@ -274,15 +275,54 @@ def test_embed_bytes_raises_when_mindir_is_missing(tmp_path: Path) -> None:
         backend.embed_bytes(b"fake-image")
 
 
-def test_recognize_returns_backend_name_when_model_is_ready(tmp_path: Path, monkeypatch) -> None:
+def test_embed_bytes_raises_when_mindspore_is_unavailable(tmp_path: Path, monkeypatch) -> None:
+    model_path = tmp_path / "facenet_vggface2.mindir"
+    model_path.write_bytes(b"mindir")
+    monkeypatch.setattr(backend_module, "ms", None)
+
+    backend = MindSporeEmbeddingBackend(model_path=model_path)
+
+    with pytest.raises(MindSporeModelNotReady):
+        backend.embed_bytes(b"fake-image")
+
+
+def test_recognize_returns_unknown_when_score_is_below_threshold(tmp_path: Path, monkeypatch) -> None:
     model_path = tmp_path / "facenet_vggface2.mindir"
     model_path.write_bytes(b"mindir")
 
-    backend = MindSporeEmbeddingBackend(model_path=model_path)
-    monkeypatch.setattr(backend, "embed_bytes", lambda image_bytes: np.ones((512,), dtype=np.float32))
+    backend = MindSporeEmbeddingBackend(model_path=model_path, threshold=0.72)
+    monkeypatch.setattr(
+        backend,
+        "embed_bytes",
+        lambda image_bytes: np.array([1.0, 0.0], dtype=np.float32),
+    )
 
-    payload = backend.recognize_bytes(b"fake-image", {"alice": np.ones((512,), dtype=np.float32)})
+    payload = backend.recognize_bytes(
+        b"fake-image", {"alice": np.array([0.0, 1.0], dtype=np.float32)}
+    )
 
+    assert payload["name"] == "未知"
+    assert payload["matched"] is False
+    assert payload["backend"] == "mindspore_embedding"
+
+
+def test_recognize_returns_name_when_score_meets_threshold(tmp_path: Path, monkeypatch) -> None:
+    model_path = tmp_path / "facenet_vggface2.mindir"
+    model_path.write_bytes(b"mindir")
+
+    backend = MindSporeEmbeddingBackend(model_path=model_path, threshold=0.72)
+    monkeypatch.setattr(
+        backend,
+        "embed_bytes",
+        lambda image_bytes: np.array([1.0, 0.0], dtype=np.float32),
+    )
+
+    payload = backend.recognize_bytes(
+        b"fake-image", {"alice": np.array([1.0, 0.0], dtype=np.float32)}
+    )
+
+    assert payload["name"] == "alice"
+    assert payload["matched"] is True
     assert payload["backend"] == "mindspore_embedding"
 ```
 
@@ -305,9 +345,13 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 
-import mindspore as ms
 import numpy as np
 from PIL import Image
+
+try:
+    import mindspore as ms
+except ImportError:
+    ms = None
 
 
 class MindSporeModelNotReady(RuntimeError):
@@ -315,11 +359,14 @@ class MindSporeModelNotReady(RuntimeError):
 
 
 class MindSporeEmbeddingBackend:
-    def __init__(self, model_path: Path) -> None:
+    def __init__(self, model_path: Path, threshold: float = 0.72) -> None:
         self.model_path = Path(model_path)
+        self.threshold = float(threshold)
         self._graph = None
 
     def _load_graph(self):
+        if ms is None:
+            raise MindSporeModelNotReady("mindspore is unavailable")
         if not self.model_path.exists():
             raise MindSporeModelNotReady(f"missing model: {self.model_path}")
         if self._graph is None:
@@ -330,10 +377,14 @@ class MindSporeEmbeddingBackend:
     def embed_bytes(self, image_bytes: bytes) -> np.ndarray:
         graph = self._load_graph()
         image = Image.open(BytesIO(image_bytes)).convert("RGB").resize((160, 160))
-        array = np.asarray(image, dtype=np.float32) / 255.0
+        array = np.asarray(image, dtype=np.float32)
+        array = ((array / 255.0) - 0.5) / 0.5
         array = np.transpose(array, (2, 0, 1))[None, ...]
         tensor = ms.Tensor(array, ms.float32)
         embedding = graph(tensor).asnumpy()[0]
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
         return embedding.astype(np.float32)
 
     def recognize_bytes(self, image_bytes: bytes, centroids: dict[str, np.ndarray]) -> dict:
@@ -345,9 +396,10 @@ class MindSporeEmbeddingBackend:
             if score > best_score:
                 best_name = name
                 best_score = score
+        matched = best_score >= self.threshold
         return {
-            "name": best_name,
-            "matched": best_score >= 0.72,
+            "name": best_name if matched else "未知",
+            "matched": matched,
             "score": round(best_score, 4),
             "backend": "mindspore_embedding",
             "ready": True,
@@ -359,10 +411,10 @@ class MindSporeEmbeddingBackend:
 Run:
 
 ```bash
-PYTHONPATH=. UV_CACHE_DIR=/tmp/uv-cache UV_PYTHON_INSTALL_DIR=/tmp/uv-python uv run --with pytest pytest tests/server/test_mindspore_backend.py -q
+PYTHONPATH=. UV_CACHE_DIR=/tmp/uv-cache UV_PYTHON_INSTALL_DIR=/tmp/uv-python uv run --with pytest python -m pytest tests/server/test_mindspore_backend.py -q
 ```
 
-Expected: PASS with `2 passed`
+Expected: PASS with `4 passed`
 
 - [ ] **Step 5: Commit**
 
