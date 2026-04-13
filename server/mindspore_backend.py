@@ -41,6 +41,13 @@ class MindSporeEmbeddingBackend:
                 ) from exc
         return self._model
 
+    def is_ready(self) -> bool:
+        try:
+            self._load_model()
+        except MindSporeModelNotReady:
+            return False
+        return True
+
     def embed_bytes(self, image_bytes: bytes) -> np.ndarray:
         model = self._load_model()
         image = Image.open(BytesIO(image_bytes)).convert("RGB").resize((160, 160))
