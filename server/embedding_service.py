@@ -381,6 +381,20 @@ def create_app(
         return model_path.exists() and label_map_path.exists()
 
 
+    def classifier_class_count(label_map_path: Path) -> int:
+        if not label_map_path.exists():
+            return 0
+        try:
+            payload = json.loads(label_map_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        if isinstance(payload, dict):
+            return len(payload)
+        if isinstance(payload, list):
+            return len(payload)
+        return 0
+
+
     @app.get("/health")
     def health() -> dict:
         service = get_service()
@@ -388,6 +402,7 @@ def create_app(
         ready = backend.is_ready()
         classifier_backend = get_classifier_backend()
         classifier_ready = classifier_is_ready(classifier_backend)
+        label_map_path = classifier_assets.label_map_path
         return {
             "status": "ok",
             "active_backend": "mindspore_embedding"
@@ -397,8 +412,10 @@ def create_app(
             "mindspore_model_path": str(backend.model_path),
             "classifier_model_ready": classifier_ready,
             "classifier_model_path": str(classifier_assets.mindir_path),
-            "classifier_label_map_path": str(classifier_assets.label_map_path),
+            "classifier_label_map_path": str(label_map_path),
             "classifier_backend_available": classifier_backend is not None,
+            "classifier_label_map_exists": label_map_path.exists(),
+            "classifier_class_count": classifier_class_count(label_map_path),
             "device": service.device,
             "model": service.model_name,
             "threshold": service.threshold,
@@ -429,13 +446,61 @@ def create_app(
 
 
     @app.post("/recognize")
-    async def recognize(photo: UploadFile = File(...)) -> dict:
+    async def recognize(
+        photo: UploadFile = File(...),
+        backend: str = Form(""),
+    ) -> dict:
         service = get_service()
-        backend = get_mindspore_backend()
         image_bytes = await photo.read()
         if not image_bytes:
             raise HTTPException(status_code=400, detail="empty photo")
         read_image_bytes(image_bytes)
+        backend_name = (backend or "").strip()
+        if backend_name not in {"", "mindspore_embedding", "cnn_classifier"}:
+            raise HTTPException(status_code=400, detail="invalid backend")
+        if backend_name == "cnn_classifier":
+            classifier_backend = get_classifier_backend()
+            classifier_ready = classifier_is_ready(classifier_backend)
+            identity_count = service.store.identity_count()
+            embedding_count = service.store.embedding_count()
+            if not classifier_ready:
+                return {
+                    "name": "未知",
+                    "matched": False,
+                    "score": 0.0,
+                    "candidate_name": "未知",
+                    "candidate_score": 0.0,
+                    "threshold": service.threshold,
+                    "identity_count": identity_count,
+                    "embedding_count": embedding_count,
+                    "backend": "cnn_classifier",
+                    "ready": False,
+                    "detail": "classifier model not ready",
+                }
+            try:
+                payload = classifier_backend.predict_bytes(image_bytes)
+            except Exception:
+                return {
+                    "name": "未知",
+                    "matched": False,
+                    "score": 0.0,
+                    "candidate_name": "未知",
+                    "candidate_score": 0.0,
+                    "threshold": service.threshold,
+                    "identity_count": identity_count,
+                    "embedding_count": embedding_count,
+                    "backend": "cnn_classifier",
+                    "ready": False,
+                    "detail": "classifier prediction failed",
+                }
+            payload["threshold"] = service.threshold
+            payload["identity_count"] = identity_count
+            payload["embedding_count"] = embedding_count
+            payload["backend"] = payload.get("backend", "cnn_classifier")
+            payload["ready"] = True
+            return payload
+
+        backend = get_mindspore_backend()
         centroids = service.store.load_all_centroids()
         identity_count = len(centroids)
         embedding_count = service.store.embedding_count()

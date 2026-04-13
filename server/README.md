@@ -82,7 +82,11 @@ server/
 - `mindspore_embedding`
   以 `InceptionResnetV1(vggface2)` 的 embedding 推理为主。
 - `cnn_classifier`
-  以分类器模型进行识别推理，产物独立存放在 `server/runtime/classifier/`。
+  以分类器模型进行识别推理，需要在 `/recognize` 请求中选择
+  `backend=cnn_classifier`，产物独立存放在 `server/runtime/classifier/`。
+
+分类器推理仅在分类器后端就绪且显式选择 `backend=cnn_classifier` 时生效。
+`/train_classifier` 目前只返回训练准备状态与产物路径，用于提供分类器路径控制面。
 
 其中 embedding 侧的策略是：
 
