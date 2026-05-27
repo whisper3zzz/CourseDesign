@@ -37,5 +37,9 @@ __pycache__/*
 /server/runtime/*
 !/server/runtime/.gitkeep
 /docs/智能系统课程设计实验报告.md
+/docs/智能系统课程设计实验报告.docx
+/docs/智能系统课程设计实验报告附录.md
+/docs/智能系统课程设计实验报告附录.docx
 /docs/assets/report_ui_*.png
+/docs/assets/智能系统课程设计实验报告附录_mermaid_*.png
 /scripts/start_with_ssh_tunnel.local.sh
